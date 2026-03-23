@@ -5,9 +5,15 @@ A Claude Code skill.
 Score a markdown document. Mutate the weakest part. Keep it only if the
 score went up. Repeat.
 
-Builds LLM judges from your own labels, no API key needed. Works for business
-plans, skills, SOPs, technical specs -- anything where you can tell PASS from
-FAIL. Claude Code does the reasoning; scripts handle scoring and data.
+Regular prompting is a random walk -- revisions go sideways as often as
+forward, the LLM grades its own homework, and you lose track after a few
+passes. autorefine separates the judges from the writer, targets one
+weakness per iteration, only keeps what scores higher, detects when it's
+hit a ceiling, and periodically attacks the document from a hostile
+reader's perspective.
+
+Works for business plans, skills, SOPs, technical specs -- anything where
+you can tell PASS from FAIL. No API key needed.
 
 `/autorefine [project_path]` -- requires Python 3.11+, `rich`, and Claude Code.
 
