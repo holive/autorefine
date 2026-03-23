@@ -47,9 +47,24 @@ judges excerpts, and proposes mutations directly.
    ```bash
    python3 $SKILL_DIR/phase1/3_label.py --source real --input artifact_draft.md
    ```
-   **batch mode:** for repeat runs or automated testing, use `--dry-run` first to
-   see which pairs will be presented, then `--batch answers.json` to label
-   non-interactively:
+   **assisted labeling (recommended):** pre-label excerpts to reduce manual
+   effort. run `--assist` twice -- first generates the request file, then
+   codex or claude code pre-labels, then the human reviews with Enter-to-accept:
+   ```bash
+   # step 1: generate prelabel request
+   python3 $SKILL_DIR/phase1/3_label.py --source real --input artifact_draft.md --assist
+   # step 2: pre-label with codex (if available) or claude code
+   #   codex: codex exec --full-auto "read examples/_prelabel_request.jsonl and
+   #          examples/dimensions.md. for each pair, evaluate the excerpt against
+   #          the dimension rule. write results to examples/_prelabel_response.jsonl
+   #          format: {dimension, heading, model_label: PASS|FAIL, model_reason}"
+   #   claude: read the request file and write the response file directly
+   # step 3: assisted review (Enter accepts, p/f overrides)
+   python3 $SKILL_DIR/phase1/3_label.py --source real --input artifact_draft.md --assist
+   ```
+   override rate > 30% signals unreliable pre-labels -- switch to interactive mode.
+
+   **batch mode:** for fully automated / CI runs, use `--dry-run` + `--batch`:
    ```bash
    python3 $SKILL_DIR/phase1/3_label.py --source real --input artifact_draft.md --dry-run
    python3 $SKILL_DIR/phase1/3_label.py --source real --input artifact_draft.md --batch answers.json

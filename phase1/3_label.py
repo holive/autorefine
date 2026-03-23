@@ -729,6 +729,225 @@ def batch_label_real(
     console.print(f"\n[green]{matched} labels written to {output_path}[/green]")
 
 
+def write_prelabel_request(
+    excerpts: List[Dict],
+    dimensions: List[Dict],
+    output_path: Path = Path("examples/_prelabel_request.jsonl"),
+):
+    """write prelabel request file for assisted labeling.
+
+    generates one line per excerpt+dimension pair (after relevance filtering)
+    for an external model to pre-label before the human reviews.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    excerpt_dims = []
+    for exc in excerpts:
+        relevant_dims = [d for d in dimensions if is_relevant(exc["text"], d["keywords"])]
+        if relevant_dims:
+            excerpt_dims.append((exc, relevant_dims))
+
+    total_pairs = sum(len(dims) for _, dims in excerpt_dims)
+
+    with open(output_path, 'w') as f:
+        for excerpt, relevant_dims in excerpt_dims:
+            for dim in relevant_dims:
+                entry = {
+                    "text": excerpt["text"],
+                    "dimension": dim["name"],
+                    "heading": excerpt["heading"],
+                    "definition": dim["definition"],
+                }
+                f.write(json.dumps(entry) + "\n")
+
+    console.print(f"\n[bold cyan]assist mode: wrote {total_pairs} pairs to {output_path}[/bold cyan]")
+    console.print(f"\n[bold]next:[/bold] pre-label these pairs with codex or claude code.")
+    console.print(f"  read {output_path}, evaluate each pair, write results to:")
+    console.print(f"  examples/_prelabel_response.jsonl")
+    console.print(f'  format: {{"dimension": "name", "heading": "section", "model_label": "PASS|FAIL", "model_reason": "1 sentence"}}')
+    console.print(f"\n  then re-run with --assist to enter review mode.")
+
+    return total_pairs
+
+
+def assisted_label_real(
+    excerpts: List[Dict],
+    dimensions: List[Dict],
+    output_path: Path,
+    response_path: Path,
+):
+    """assisted interactive labeling with pre-labels from external model.
+
+    shows model suggestion for each pair. Enter accepts, p/f overrides.
+    """
+    # load pre-labels and build lookup
+    prelabels = {}
+    with open(response_path) as f:
+        for line in f:
+            if line.strip():
+                entry = json.loads(line)
+                key = (entry["dimension"], entry.get("heading", ""))
+                prelabels[key] = entry
+
+    # relevance filtering (same as interactive)
+    excerpt_dims = []
+    for exc in excerpts:
+        relevant_dims = [d for d in dimensions if is_relevant(exc["text"], d["keywords"])]
+        if relevant_dims:
+            excerpt_dims.append((exc, relevant_dims))
+
+    total_pairs = sum(len(dims) for _, dims in excerpt_dims)
+    matched_prelabels = sum(
+        1 for exc, dims in excerpt_dims
+        for d in dims if (d["name"], exc["heading"]) in prelabels
+    )
+
+    console.print(f"\n[bold cyan]assisted review mode[/bold cyan]")
+    console.print(f"  {total_pairs} pairs to review, {matched_prelabels} have pre-labels")
+    console.print(
+        "\n  [green][enter][/green] accept model suggestion  "
+        "[green][p]ass[/green]  [red][f]ail[/red]  "
+        "[yellow][s]kip[/yellow]  [dim][q]uit[/dim]\n"
+    )
+
+    # resume support
+    existing = load_existing_labels(output_path)
+    labeled_pairs = {(e["text"], e["dimension"]) for e in existing if "text" in e and "dimension" in e}
+
+    accepted = 0
+    overridden = 0
+    skipped = 0
+    no_prelabel = 0
+    quit_requested = False
+    excerpt_num = 0
+
+    for excerpt, relevant_dims in excerpt_dims:
+        if quit_requested:
+            break
+        excerpt_num += 1
+
+        console.print("━" * 60)
+        console.print(
+            f"[bold]EXCERPT {excerpt_num}/{len(excerpt_dims)}[/bold]  "
+            f"[dim]section: {excerpt['heading']}[/dim]"
+        )
+        console.print("━" * 60)
+        console.print(Panel(excerpt["text"], border_style="blue"))
+
+        for dim in relevant_dims:
+            if quit_requested:
+                break
+            if (excerpt["text"], dim["name"]) in labeled_pairs:
+                continue
+
+            key = (dim["name"], excerpt["heading"])
+            pre = prelabels.get(key)
+
+            console.print(f"\n  [bold]{dim['name']}[/bold]: [dim]{dim['definition']}[/dim]")
+
+            if pre:
+                ml = pre.get("model_label", "?")
+                mr = pre.get("model_reason", "")
+                color = "green" if ml == "PASS" else "red"
+                console.print(f"  [dim]model suggestion:[/dim] [{color}]{ml}[/{color}] -- {mr}")
+
+                choice = Prompt.ask(
+                    "  [green][enter][/green] accept  [green][p]ass[/green]  [red][f]ail[/red]  [yellow][s]kip[/yellow]  [dim][q]uit[/dim]",
+                    choices=["", "p", "f", "s", "q"],
+                    default="",
+                    show_choices=False,
+                ).lower()
+
+                if choice == "q":
+                    quit_requested = True
+                    break
+                if choice == "s":
+                    skipped += 1
+                    continue
+                if choice == "":
+                    # accept model suggestion
+                    label_data = {
+                        "text": excerpt["text"],
+                        "dimension": dim["name"],
+                        "human_label": ml,
+                        "critique": mr,
+                        "source": "real",
+                        "model_label": ml,
+                        "model_reason": mr,
+                    }
+                    save_label(output_path, label_data)
+                    accepted += 1
+                    continue
+                # override
+                label = "PASS" if choice == "p" else "FAIL"
+                console.print(
+                    f"\n  [bold yellow]<< OVERRIDE >>[/bold yellow] "
+                    f"you said [bold]{label}[/bold], model said [bold]{ml}[/bold]"
+                )
+                critique = Prompt.ask("  [dim]why? (1-2 sentences)[/dim]", default="").strip()
+                label_data = {
+                    "text": excerpt["text"],
+                    "dimension": dim["name"],
+                    "human_label": label,
+                    "critique": critique,
+                    "source": "real",
+                    "model_label": ml,
+                    "model_reason": mr,
+                }
+                save_label(output_path, label_data)
+                overridden += 1
+            else:
+                # no pre-label -- fall back to manual
+                no_prelabel += 1
+                while True:
+                    choice = Prompt.ask(
+                        "  [green][p]ass[/green]  [red][f]ail[/red]  [yellow][s]kip[/yellow]  [dim][q]uit[/dim]",
+                        choices=["p", "f", "s", "q"],
+                        show_choices=False,
+                    ).lower()
+                    if choice == "q":
+                        quit_requested = True
+                        break
+                    if choice == "s":
+                        skipped += 1
+                        break
+                    if choice in ("p", "f"):
+                        label = "PASS" if choice == "p" else "FAIL"
+                        critique = Prompt.ask("  [dim]why?[/dim]", default="").strip()
+                        label_data = {
+                            "text": excerpt["text"],
+                            "dimension": dim["name"],
+                            "human_label": label,
+                            "critique": critique,
+                            "source": "real",
+                            "model_label": None,
+                            "model_reason": None,
+                        }
+                        save_label(output_path, label_data)
+                        break
+
+    # summary
+    total_labeled = accepted + overridden
+    override_pct = int(overridden / total_labeled * 100) if total_labeled > 0 else 0
+    table = Table(title="assisted labeling summary", show_header=True)
+    table.add_column("metric", style="cyan")
+    table.add_column("count", justify="right")
+    table.add_row("accepted (enter)", str(accepted))
+    table.add_row("overridden (p/f)", str(overridden))
+    table.add_row("skipped", str(skipped))
+    table.add_row("no pre-label (manual)", str(no_prelabel))
+    table.add_row("override rate", f"{override_pct}%")
+    console.print(table)
+
+    if override_pct > 30:
+        console.print(
+            "\n[yellow]override rate > 30% -- pre-labels may be unreliable.\n"
+            "consider switching to full interactive mode (without --assist).[/yellow]"
+        )
+
+    console.print(f"\n[green]assisted labeling complete! {total_labeled} labels written to {output_path}[/green]")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="interactive CLI labeler for real and synthetic excerpts"
@@ -775,6 +994,13 @@ def main():
         help="(real only) print excerpt+dimension pairs that would be presented, "
              "then exit. outputs JSON to stdout for building a --batch file."
     )
+    parser.add_argument(
+        "--assist",
+        action="store_true",
+        help="(real only) assisted labeling: first run generates prelabel request "
+             "file, then an external model pre-labels, then second run enters "
+             "review mode with Enter-to-accept for obvious cases."
+    )
 
     args = parser.parse_args()
 
@@ -804,6 +1030,18 @@ def main():
         if args.batch:
             batch_label_real(excerpts, dimensions, args.output, args.batch)
             return
+
+        if getattr(args, 'assist', False):
+            response_path = args.output.parent / "_prelabel_response.jsonl"
+            if not response_path.exists():
+                # step 1: generate request for external model
+                write_prelabel_request(excerpts, dimensions,
+                                       args.output.parent / "_prelabel_request.jsonl")
+                return
+            else:
+                # step 2: assisted review with pre-labels
+                assisted_label_real(excerpts, dimensions, args.output, response_path)
+                return
 
         # label real excerpts interactively (with relevance filtering)
         label_real_excerpts(excerpts, dimensions, args.output)
