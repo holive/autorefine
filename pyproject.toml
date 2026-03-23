@@ -1,0 +1,16 @@
+[project]
+name = "autorefine"
+version = "0.1.0"
+description = "autonomous improvement loop for markdown artifacts"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "rich>=13.0.0",
+    "jsonlines>=4.0.0",
+]
+
+[project.scripts]
+autorefine-label = "phase1.label:main"
+autorefine-generate = "phase1.generate_examples:main"
+autorefine-validate = "phase1.validate_judge:main"
+autorefine-run = "phase2.run:main"
