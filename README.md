@@ -1,49 +1,49 @@
 # autorefine
 
 Autonomous improvement loop for markdown artifacts. You write a rough draft,
-define what "good" looks like, and the system builds validated LLM judges, then
-runs a mutation-and-score loop that makes the document measurably better with
-each iteration.
+define what "good" looks like, and the system builds LLM judges that are
+validated against your own labels. Then it runs a mutation-and-score loop,
+keeps what scores higher, discards the rest.
 
-For anyone iteratively improving a document -- business plan, skill, SOP,
-technical spec -- where quality has measurable dimensions.
+Business plans, skills, SOPs, technical specs. Anything where you can define
+quality dimensions and tell PASS from FAIL.
 
-Claude Code is the LLM. No API key needed. Scripts handle data and scoring;
-Claude Code does all reasoning.
+Claude Code is the LLM, so no API key is needed. Scripts handle data and
+scoring. Claude Code does all the reasoning.
 
-**Two phases:**
-- **Phase 1** -- build one validated judge per quality dimension (run once)
-- **Phase 2** -- autonomous loop: score, mutate, re-judge, keep or discard (run overnight)
+Phase 1 builds one validated judge per quality dimension. Run it once.
+Phase 2 is the autonomous loop: score, mutate, re-judge, keep or discard.
+Run it overnight.
 
-**Requirements:** Python 3.11+, `rich` (`pip install rich`), Claude Code
+Requires Python 3.11+, `rich` (`pip install rich`), and Claude Code.
 
-**Start:** `/autorefine [project_path]`
+Start with `/autorefine [project_path]`.
 
 ---
 
-## How It Works
+## How it works
 
-### Phase 1: Build the Judges
+### Phase 1: build the judges
 
-You start by filling in `improve.md` -- a template that forces you to define
-your artifact, your reader, what good looks like, and what must never change.
-The template exists because "make it better" is too vague for a judge. You need
+You start by filling in `improve.md`, a template that forces you to define your
+artifact, your reader, what good looks like, and what must never change. The
+template exists because "make it better" is too vague for a judge. You need
 concrete, observable criteria a reader could point to in the text.
 
-Then write `artifact_draft.md` -- a genuine first attempt, however rough. Error
+Then write `artifact_draft.md`, a genuine first attempt, however rough. Error
 analysis needs text to fail on.
 
-**Manual audit.** You read your draft against your rubric and identify 10-15
-specific failure observations. Then group them into 3-6 dimensions (recurring
-failure patterns). You do this, not the LLM, because you know your domain and
-your reader. The LLM can help with a first pass, but the final list must reflect
-what *you* think matters.
+**Manual audit.** Read your draft against your rubric and identify 10-15
+specific failure observations. Group them into 3-6 dimensions (recurring failure
+patterns). You do this, not the LLM, because you know your domain and your
+reader. The LLM can do a first pass, but the final list has to reflect what
+*you* think matters.
 
 Each candidate dimension passes a quality check: is it grounded in a real
 failure? Can you write PASS/FAIL right now? Is it atomic (one thing)? Is it
 subjective (can't a regex handle it)? Anything a regex can check becomes a cheap
-check -- free, instant, deterministic. Every judge you don't build is less work
-to validate and maintain.
+check, free, instant, deterministic. Every judge you don't build is less work to
+validate and maintain.
 
 **Labeling.** You become the human judge. The script shows you sections from
 your draft alongside each dimension, and you decide PASS or FAIL with a brief
@@ -62,56 +62,53 @@ the improvement loop.
 After all judges pass, you initialize Phase 2. The system SHA-256 hashes any
 constrained sections so mutations that touch frozen content get auto-reverted.
 
-### Phase 2: The Loop
+### Phase 2: the loop
 
-Each iteration follows 6 steps:
+Each iteration has 6 steps.
 
 **Score.** Run cheap checks (deterministic assertions), then launch one parallel
-agent per dimension to judge the artifact. Each judge returns PASS or FAIL.
-The composite score is a weighted sum -- dimension weights (set in judge
-frontmatter) let you express that some things matter more than others. Binary
-judges are more reliable than graded 1-10 scores; weights handle importance
-separately.
+agent per dimension to judge the artifact. Each judge returns PASS or FAIL. The
+composite score is a weighted sum. Dimension weights (set in judge frontmatter)
+let you express that some things matter more than others. Binary judges are more
+reliable than graded 1-10 scores; weights handle importance separately.
 
-If you have a `context.md` file with verified facts (market sizes, financials,
-team details), it gets injected into judge prompts and mutation requests so the
-LLM respects ground truth. Only you can verify facts, so this is your channel
-for injecting truth into an autonomous loop.
+If you have a `context.md` with verified facts (market sizes, financials, team
+details), it gets injected into judge prompts and mutation requests so the LLM
+respects ground truth. Only you can verify facts, so this is your channel for
+injecting truth into an autonomous loop.
 
-**Mutate.** The script selects the weakest dimension and builds a mutation
-request targeting only that dimension. One targeted change produces a clean
-signal -- mutations that try to fix everything at once tend to regress on
-dimensions they weren't targeting.
+**Mutate.** The script picks the weakest dimension and builds a mutation request
+targeting only that one. One targeted change produces a clean signal. Mutations
+that try to fix everything at once tend to regress on dimensions they weren't
+targeting.
 
 **Re-judge.** Only the targeted dimension gets re-judged. Non-targeted
-dimensions carry forward their before-scores. This eliminates judge variance on
-unrelated dimensions -- without it, random noise on other dimensions can flip
-the verdict for reasons unrelated to the mutation.
+dimensions carry forward their before-scores. Without this, random noise on
+other dimensions can flip the verdict for reasons that have nothing to do with
+the mutation.
 
-**Verdict.** If the composite score is strictly better, the mutation is adopted.
-Equal or worse is discarded. No lateral accepts -- they let the artifact drift
-without improving. Over many iterations, lateral accepts accumulate noise.
-Every adopted version is measurably better than the one before it.
+**Verdict.** If the composite score went up, the mutation is adopted. Equal or
+worse is discarded. No lateral accepts. They let the artifact drift without
+improving, and over many iterations that drift accumulates into noise.
 
 **Stall detection.** After 3+ consecutive discards or a score plateau, the
-system warns that a writing ceiling may have been reached. Without detection,
-the loop burns tokens on mutations that will never be adopted.
+system warns you. Without this, the loop burns tokens on mutations that will
+never land.
 
-**Adversarial pass.** Every Nth iteration (default 5), a hostile-reader analysis
-finds gaps the rubric judges can't see. The adversarial persona (defined in
-`improve.md`) identifies 3-5 objections, classifies each as a writing gap
-(fixable by the loop) or data gap (requires human intervention). Findings feed
-into the next mutation as additional context, then clear -- they're one-shot,
-not permanent.
+**Adversarial pass.** Every Nth iteration (default 5), a hostile-reader
+analysis looks for gaps the rubric judges miss. The adversarial persona (defined
+in `improve.md`) raises 3-5 objections and classifies each as a writing gap
+(fixable by the loop) or a data gap (needs human intervention). Findings feed
+into the next mutation, then clear. One-shot, not permanent.
 
 **Human checkpoints.** Periodically, you review the current best version against
 the last human-approved version and answer the end-to-end question from
-`improve.md`. Judges optimize proxy metrics; the human checks the actual goal.
-This is the core principle: **judge as filter, human as objective**.
+`improve.md`. Judges optimize proxy metrics. The human checks the actual goal.
+The principle is simple: judges filter, humans decide.
 
 ---
 
-## Under the Hood
+## Under the hood
 
 ### Architecture
 
@@ -124,10 +121,10 @@ Two roles, strictly separated:
 
 No LLM calls in any script. All handoff is file-based: scripts write request
 files, Claude Code processes them, scripts read response files. Files live in
-the project directory (not /tmp) because subagents run in a sandbox that
-restricts access outside the project tree.
+the project directory (not /tmp) because subagents run in a sandbox that can't
+reach outside the project tree.
 
-### State Machine
+### State machine
 
 ```
 initialized -> awaiting_judge_before -> awaiting_mutation -> awaiting_judge_after -> completed
@@ -137,7 +134,7 @@ initialized -> awaiting_judge_before -> awaiting_mutation -> awaiting_judge_afte
 
 State persists in `runs/current_iteration.json` across Claude Code turns.
 
-### Composite Score
+### Composite score
 
 ```
 cheap_pass  = sum(1.0 for each passing cheap check)
@@ -147,7 +144,7 @@ llm_total   = sum(weight[dim] for all LLM dimensions)
 composite   = (cheap_pass + llm_pass) / (cheap_total + llm_total)
 ```
 
-### Weakest Dimension Selection
+### Weakest dimension selection
 
 Tiebreaking chain when multiple dimensions fail:
 1. Historical fail frequency (last 3 iterations)
@@ -156,13 +153,13 @@ Tiebreaking chain when multiple dimensions fail:
 
 If all pass: same chain using history only.
 
-### Stall Detection
+### Stall detection
 
 Two independent signals, either triggers a warning:
-- **Consecutive discards:** N discards in a row (default threshold: 3)
-- **Score plateau:** identical `composite_before` for N consecutive iterations
+- Consecutive discards: N in a row (default threshold: 3)
+- Score plateau: identical `composite_before` for N consecutive iterations
 
-### Rogan-Gladen Correction (Morning Reports)
+### Rogan-Gladen correction (morning reports)
 
 Observed pass rate != true pass rate when judges have imperfect TPR/TNR.
 The morning report corrects for known judge error rates:
@@ -173,22 +170,22 @@ theta = (p_observed + TNR - 1) / (TPR + TNR - 1)
 
 Only applied when TPR + TNR > 1. Clamped to [0, 1].
 
-### Constraint Hashing
+### Constraint hashing
 
 At init, constrained sections (from `improve.md`) are extracted by heading regex
 and SHA-256 hashed. At each `score-before`, current hashes are compared. Any
 mismatch reverts the artifact to `approved.md` and aborts the iteration.
 
-### Adversarial Pass Lifecycle
+### Adversarial pass lifecycle
 
-1. `adversarial` -- writes request with artifact + persona + instructions
-2. Claude Code analyzes, writes response with objections (scored 1-10, classified writing/data gap)
-3. `adversarial-process` -- saves findings to state and log
+1. `adversarial` writes a request with the artifact, persona, and instructions
+2. Claude Code analyzes and writes a response with objections (scored 1-10, classified as writing or data gap)
+3. `adversarial-process` saves findings to state and log
 4. Next `score-before` carries findings forward
-5. Next `score-after` injects findings into mutation request
+5. Next `score-after` injects findings into the mutation request
 6. Findings clear after one mutation cycle (one-shot, not permanent)
 
-### Judge Validation Pipeline
+### Judge validation pipeline
 
 ```
 labels -> 3-way stratified split (train 15% / dev 43% / test 42%)
@@ -201,7 +198,7 @@ labels -> 3-way stratified split (train 15% / dev 43% / test 42%)
 Wilson score confidence intervals at 95%. Small samples (< 7) warn but don't
 block. Passing judges get test metrics stamped into frontmatter.
 
-### File Layout
+### File layout
 
 ```
 project/
@@ -227,9 +224,9 @@ project/
     +-- iter_NNN/               # per-iteration request/response files
 ```
 
-### CLI Reference
+### CLI reference
 
-**Phase 2** (`phase2/run.py`):
+Phase 2 (`phase2/run.py`):
 
 | Command | Key args | Purpose |
 |---|---|---|
@@ -243,14 +240,14 @@ project/
 | `report` | `[--log]`, `[--judge-dir]` | Morning report with Rogan-Gladen correction |
 | `review-checkpoints` | `--improve` | Interactive human checkpoint review |
 
-**Phase 1:**
+Phase 1:
 
 | Script | Key args | Purpose |
 |---|---|---|
 | `3_label.py` | `--source real\|synthetic`, `--input`, `[--auto-accept]` | Interactive or auto labeling |
 | `4_validate_judge.py` | `--mode split\|score\|flip-to-judge`, `--dimension` | Split, score, align labels |
 
-### Design Decisions
+### Design decisions
 
 | Decision | Alternative | Why this choice |
 |---|---|---|
