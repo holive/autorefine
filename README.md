@@ -121,8 +121,8 @@ excerpts. Over 10 iterations, that's 2-3 false improvements entering the
 artifact. At 80/80, the expected false-accept rate drops enough that the
 keep/discard logic stays meaningful. 90/90 is the target; 80/80 is the floor.
 Below that, the judge corrupts the loop faster than the loop improves the
-artifact. This threshold came from testing -- at 75% TNR, we observed adopted
-mutations that made the artifact worse according to human review.
+artifact. This threshold came from testing -- at 75% TNR, adopted mutations that
+made the artifact worse according to human review were observed.
 
 ### Phase 2: the autonomous loop (~2-5 min per iteration)
 
@@ -134,7 +134,7 @@ average of all checks and judge verdicts.
 
 *Why binary judges instead of 1-10 scores:* LLMs produce inconsistent numeric
 scores -- the same text can get 7/10 and 5/10 across runs. Binary PASS/FAIL
-is dramatically more reliable (our validation tests show 90-100% agreement).
+is dramatically more reliable (validation tests show 90-100% agreement).
 Dimension weights handle importance separately without relying on the model to
 produce consistent numbers.
 
@@ -179,7 +179,7 @@ acceptance criterion for an autonomous loop.
 the next adoption. This means a discarded mutation doesn't trigger re-judging
 of the unchanged artifact.
 
-*Why:* in testing, we observed a score regression from 1.00 to 0.86 on an
+*Why:* in testing, a score regression from 1.00 to 0.86 was observed on an
 unchanged artifact because a judge flipped on `call_to_action_clarity` between
 runs. Caching eliminates this class of variance entirely. Use `--force-rejudge`
 if you suspect the cache is stale.
@@ -208,8 +208,8 @@ stable across 5 iterations. Running it only on stall would miss gaps that the
 rubric judges will never catch.
 
 *Why findings persist in adversarial_log.jsonl:* in the original design,
-findings were one-shot (used once, then cleared). In testing, we found that
-the most valuable output of a 10-iteration run was the adversarial findings --
+findings were one-shot (used once, then cleared). In testing, the most
+valuable output of a 10-iteration run turned out to be the adversarial findings --
 they correctly identified gaps (team credibility, migration story) that no
 rubric dimension covered. Persisting them gives the human a running list of
 what the rubric misses.
