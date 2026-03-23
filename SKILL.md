@@ -47,11 +47,17 @@ judges excerpts, and proposes mutations directly.
    ```bash
    python3 $SKILL_DIR/phase1/3_label.py --source real --input artifact_draft.md
    ```
+   **batch mode:** for repeat runs or automated testing, use `--dry-run` first to
+   see which pairs will be presented, then `--batch answers.json` to label
+   non-interactively:
+   ```bash
+   python3 $SKILL_DIR/phase1/3_label.py --source real --input artifact_draft.md --dry-run
+   python3 $SKILL_DIR/phase1/3_label.py --source real --input artifact_draft.md --batch answers.json
+   ```
 
-5. **Generate synthetic examples** -- Claude Code generates excerpts matching
-   the draft's style, covering each dimension with PASS and FAIL variants. Claude
-   Code reads `examples/dimensions.md` and `artifact_draft.md`, then writes
-   synthetic examples to `examples/unlabeled.jsonl`.
+5. **Generate synthetic examples** -- generate excerpts matching the draft's
+   style, covering each dimension with PASS and FAIL variants. Output to
+   `examples/unlabeled.jsonl`.
 
    Format per line:
    ```json
@@ -60,6 +66,20 @@ judges excerpts, and proposes mutations directly.
 
    Target: ~20 per dimension (10 PASS + 10 FAIL). This ensures enough data
    for validation splits (~8 per test set).
+
+   **cross-model generation (recommended):** to reduce same-model bias (where
+   claude judges text claude generated), check if `codex` CLI is available
+   (`which codex`). if so, use it for synthetic generation:
+   ```bash
+   codex exec --full-auto \
+     "read examples/dimensions.md and artifact_draft.md. generate 20 synthetic \
+      excerpts for dimension '<dim>' (10 PASS + 10 FAIL). write JSONL to \
+      examples/_tmp_<dim>.jsonl"
+   ```
+   run one call per dimension (~20 examples each) rather than one massive call
+   for all dimensions. this avoids timeouts and makes validation easier.
+   if codex is unavailable, claude code generates directly (note the potential
+   for same-model bias in observations).
 
 6. **Label synthetic examples** -- recommended: auto-accept model labels.
    ```bash
@@ -123,9 +143,18 @@ python3 $SKILL_DIR/phase2/run.py score-after --improve improve.md
 Computes composite score, selects weakest dimension, writes
 `runs/iter_NNN/mutation_request.md`.
 
-**Step D -- Claude Code mutates:** read the mutation request, produce a revised
+**Step D -- Mutate the artifact:** read the mutation request, produce a revised
 artifact using the `---ARTIFACT START---` / `---ARTIFACT END---` delimiters,
 and write to `runs/iter_NNN/mutation_response.md`.
+
+**cross-model mutation (recommended):** if `codex` CLI is available, use it for
+mutations to avoid the judge evaluating text from its own model:
+```bash
+codex exec --full-auto "read runs/iter_NNN/mutation_request.md. follow its \
+  instructions exactly. write the revised artifact to \
+  runs/iter_NNN/mutation_response.md using the delimiters."
+```
+if codex is unavailable, claude code generates the mutation directly.
 
 **Step E -- Apply mutation + re-judge:**
 ```bash
@@ -186,7 +215,7 @@ project/
 +-- artifact_draft.md           # rough draft (human writes before Phase 1)
 +-- examples/
 |   +-- dimensions.md           # discovered dimensions + cheap checks
-|   +-- labels_real.jsonl       # labeled excerpts from draft
+|   +-- real_excerpts.jsonl      # labeled excerpts from draft
 |   +-- unlabeled.jsonl         # synthetic examples awaiting labels
 |   +-- synthetic_labels.jsonl  # labeled synthetic examples
 +-- judge_prompts/              # one validated judge per dimension
@@ -196,10 +225,11 @@ project/
 |   +-- <dim>_test_batch.jsonl  # test set (held out)
 +-- runs/
     +-- log.jsonl               # full iteration history
+    +-- adversarial_log.jsonl   # all adversarial findings (accumulates)
     +-- constraint_hashes.json  # SHA-256 hashes of frozen sections
     +-- approved.md             # last human-approved version
     +-- best.md                 # current judge-best version
-    +-- current_iteration.json  # iteration state for step machine
+    +-- current_iteration.json  # iteration state + score cache
     +-- iter_NNN/               # per-iteration request/response files
 ```
 
@@ -225,8 +255,19 @@ project/
 - **Context file**: optional `context.md` with human-maintained ground truth.
   Passed via `--context` to score-before and apply-mutation. Injected into
   judge prompts and mutation requests so the LLM respects verified facts.
-- **Stall detection**: verdict checks for consecutive discards and score
-  plateaus. Prints a warning when writing ceiling is likely reached.
+- **Score caching**: after an adoption, before-scores are cached and reused
+  in subsequent iterations until the next adoption. this eliminates judge
+  variance on unchanged artifacts. use `--force-rejudge` to bypass the cache.
+  cache is also invalidated when adversarial findings are present.
+- **Stall detection**: verdict checks for consecutive discards, score
+  plateaus, and all-PASS ceiling. when all dimensions pass and mutations keep
+  getting discarded, suggests adding new dimensions from adversarial findings.
+- **Adversarial log**: adversarial findings persist in `runs/adversarial_log.jsonl`
+  across iterations. morning report shows all findings, not just the latest.
+- **Cross-model generation**: using a different LLM (e.g., `codex` CLI) for
+  synthetic examples, mutations, and adversarial passes reduces same-model
+  bias. claude code auto-detects `codex` via `which codex` and uses it when
+  available. see steps 5 and D for details.
 - **Adversarial passes**: every Nth iteration (default 5), a hostile-reader
   analysis finds gaps the rubric judges miss. Findings feed into the next
   iteration's mutation request as additional context.

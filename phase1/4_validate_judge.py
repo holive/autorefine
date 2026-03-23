@@ -281,25 +281,28 @@ def go_nogo_decision(metrics: Metrics) -> Tuple[bool, str]:
 
     target: TPR >= 90% AND TNR >= 90%
     minimum: TPR >= 80% AND TNR >= 80%
-    warns (but does not block) when sample size < 7.
+    warns prominently when sample size is small.
     """
     n_pos = metrics.tp + metrics.fn
     n_neg = metrics.tn + metrics.fp
+    n_total = n_pos + n_neg
     warnings = []
     if n_pos < 7:
-        warnings.append(f"low PASS sample ({n_pos}) -- consider adding more examples")
+        warnings.append(f"very small PASS sample ({n_pos}) -- confidence interval is wide")
     if n_neg < 7:
-        warnings.append(f"low FAIL sample ({n_neg}) -- consider adding more examples")
+        warnings.append(f"very small FAIL sample ({n_neg}) -- confidence interval is wide")
+    if n_total < 10:
+        warnings.append("tip: generate more synthetic examples to increase validation confidence")
 
     if metrics.tpr >= 0.90 and metrics.tnr >= 0.90:
         msg = "meets target (TPR >= 90%, TNR >= 90%)"
         if warnings:
-            msg += " [warning: " + "; ".join(warnings) + "]"
+            msg += "\n  WARNING: " + "\n  WARNING: ".join(warnings)
         return True, msg
     if metrics.tpr >= 0.80 and metrics.tnr >= 0.80:
         msg = "meets minimum (TPR >= 80%, TNR >= 80%)"
         if warnings:
-            msg += " [warning: " + "; ".join(warnings) + "]"
+            msg += "\n  WARNING: " + "\n  WARNING: ".join(warnings)
         return True, msg
     return False, f"below minimum (TPR: {metrics.tpr:.2%}, TNR: {metrics.tnr:.2%})"
 
@@ -310,12 +313,15 @@ def split_mode(args):
     """load labels, create 3-way split, build judge prompt, export batch for claude code."""
     console.print(f"[cyan]loading labels for '{args.dimension}'...[/cyan]")
 
-    # try multiple label files
+    # try multiple label files (check both naming conventions)
     label_files = [Path(args.labels)]
-    if Path("examples/labels_real.jsonl").exists():
-        label_files.append(Path("examples/labels_real.jsonl"))
-    if Path("examples/synthetic_labels.jsonl").exists():
-        label_files.append(Path("examples/synthetic_labels.jsonl"))
+    for candidate in [
+        "examples/real_excerpts.jsonl",
+        "examples/labels_real.jsonl",
+        "examples/synthetic_labels.jsonl",
+    ]:
+        if Path(candidate).exists():
+            label_files.append(Path(candidate))
 
     examples = []
     for lf in label_files:

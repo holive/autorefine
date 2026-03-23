@@ -616,6 +616,119 @@ def auto_accept_synthetic(examples: List[Dict], output_path: Path):
     console.print(f"\n[green]{len(examples)} labels auto-accepted to {output_path}[/green]")
 
 
+def dry_run_real(excerpts: List[Dict], dimensions: List[Dict]):
+    """print excerpt+dimension pairs that would be presented, then exit.
+
+    outputs JSON array to stdout for building a --batch file.
+    """
+    excerpt_dims = []
+    for exc in excerpts:
+        relevant_dims = [d for d in dimensions if is_relevant(exc["text"], d["keywords"])]
+        if relevant_dims:
+            excerpt_dims.append((exc, relevant_dims))
+
+    pairs = []
+    for excerpt, relevant_dims in excerpt_dims:
+        for dim in relevant_dims:
+            pairs.append({
+                "dimension": dim["name"],
+                "heading": excerpt["heading"],
+                "label": "",
+                "critique": "",
+            })
+
+    # print summary table
+    console.print(f"\n[bold cyan]dry run: {len(pairs)} pairs would be presented[/bold cyan]\n")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("excerpt heading")
+    table.add_column("dimension")
+    for p in pairs:
+        table.add_row(p["heading"], p["dimension"])
+    console.print(table)
+
+    # output JSON to stdout for piping to a file
+    import json as _json
+    print(_json.dumps(pairs, indent=2))
+
+
+def batch_label_real(
+    excerpts: List[Dict],
+    dimensions: List[Dict],
+    output_path: Path,
+    batch_path: Path,
+):
+    """non-interactive labeling from a pre-computed JSON answers file."""
+    # load batch answers and build lookup
+    with open(batch_path) as f:
+        batch_answers = json.load(f)
+
+    lookup = {}
+    for answer in batch_answers:
+        key = (answer["dimension"], answer.get("heading", ""))
+        lookup[key] = answer
+
+    # run same relevance filtering as interactive mode
+    excerpt_dims = []
+    for exc in excerpts:
+        relevant_dims = [d for d in dimensions if is_relevant(exc["text"], d["keywords"])]
+        if relevant_dims:
+            excerpt_dims.append((exc, relevant_dims))
+
+    total_pairs = sum(len(dims) for _, dims in excerpt_dims)
+    console.print(f"\n[bold cyan]batch mode: {total_pairs} pairs, {len(lookup)} answers loaded[/bold cyan]\n")
+
+    matched = 0
+    skipped = 0
+    pass_count = 0
+    fail_count = 0
+
+    for excerpt, relevant_dims in excerpt_dims:
+        for dim in relevant_dims:
+            key = (dim["name"], excerpt["heading"])
+            answer = lookup.get(key)
+
+            if answer is None:
+                console.print(f"[yellow]  no answer for ({dim['name']}, {excerpt['heading']}) -- skipping[/yellow]")
+                skipped += 1
+                continue
+
+            label_str = answer.get("label", "").upper()
+            if label_str not in ("PASS", "FAIL"):
+                console.print(f"[yellow]  invalid label '{label_str}' for ({dim['name']}, {excerpt['heading']}) -- skipping[/yellow]")
+                skipped += 1
+                continue
+
+            critique = answer.get("critique", "")
+
+            if label_str == "PASS":
+                pass_count += 1
+            else:
+                fail_count += 1
+
+            label_data = {
+                "text": excerpt["text"],
+                "dimension": dim["name"],
+                "human_label": label_str,
+                "critique": critique,
+                "source": "real",
+                "model_label": None,
+                "model_reason": None,
+            }
+            save_label(output_path, label_data)
+            matched += 1
+
+    # summary
+    table = Table(title="batch labeling summary", show_header=True)
+    table.add_column("metric", style="cyan")
+    table.add_column("count", justify="right")
+    table.add_row("matched", str(matched))
+    table.add_row("skipped (no answer)", str(skipped))
+    table.add_row("PASS", str(pass_count))
+    table.add_row("FAIL", str(fail_count))
+    console.print(table)
+    console.print(f"\n[green]{matched} labels written to {output_path}[/green]")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="interactive CLI labeler for real and synthetic excerpts"
@@ -648,6 +761,20 @@ def main():
         action="store_true",
         help="(synthetic only) auto-accept model labels without interactive review"
     )
+    parser.add_argument(
+        "--batch",
+        type=Path,
+        default=None,
+        help="(real only) path to JSON file with pre-computed labels. "
+             "format: [{\"dimension\": \"...\", \"heading\": \"...\", \"label\": \"PASS|FAIL\", \"critique\": \"...\"}]. "
+             "use --dry-run first to see which pairs will be presented."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="(real only) print excerpt+dimension pairs that would be presented, "
+             "then exit. outputs JSON to stdout for building a --batch file."
+    )
 
     args = parser.parse_args()
 
@@ -670,7 +797,15 @@ def main():
         excerpts = parse_artifact_to_excerpts(args.input)
         console.print(f"[cyan]parsed {len(excerpts)} section excerpts from {args.input}[/cyan]")
 
-        # label real excerpts (with relevance filtering)
+        if args.dry_run:
+            dry_run_real(excerpts, dimensions)
+            return
+
+        if args.batch:
+            batch_label_real(excerpts, dimensions, args.output, args.batch)
+            return
+
+        # label real excerpts interactively (with relevance filtering)
         label_real_excerpts(excerpts, dimensions, args.output)
 
     else:  # synthetic

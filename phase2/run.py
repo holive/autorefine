@@ -284,7 +284,18 @@ def detect_stall(log_path: Path, threshold: int = 3) -> Dict[str, Any]:
     scores = [e.get('composite_before', -1) for e in recent]
     result['score_plateau'] = len(set(scores)) == 1 and scores[0] >= 0
 
-    result['stalled'] = (result['consecutive_discards'] >= threshold) or result['score_plateau']
+    # all-pass ceiling: all recent iterations have composite_before == 1.0 and were discarded
+    all_at_ceiling = all(
+        e.get('composite_before', 0) >= 1.0 and e.get('decision') == 'DISCARDED'
+        for e in recent
+    )
+    result['all_pass_ceiling'] = all_at_ceiling
+
+    result['stalled'] = (
+        result['consecutive_discards'] >= threshold
+        or result['score_plateau']
+        or result['all_pass_ceiling']
+    )
     return result
 
 
@@ -388,9 +399,12 @@ def init_mode(artifact_path: Path, improve_path: Path):
 
 
 def score_before_mode(artifact_path: Path, dimensions_path: Path, judge_dir: Path,
-                      improve_path: Path, context_path: Optional[Path] = None):
+                      improve_path: Path, context_path: Optional[Path] = None,
+                      force_rejudge: bool = False):
     """run cheap checks, write judge request for claude code"""
     state = load_state()
+    if force_rejudge:
+        state['force_rejudge'] = True
     iteration = state.get('iteration', 0) + 1
 
     artifact_text = artifact_path.read_text()
@@ -424,31 +438,56 @@ def score_before_mode(artifact_path: Path, dimensions_path: Path, judge_dir: Pat
     # filter out batch/results files
     judge_files = [f for f in judge_files if not any(s in f.name for s in ['_batch', '_results', '_truth', '_split'])]
 
-    context_section = build_context_section(context_path)
+    # check for cached scores (reduces judge variance between iterations)
+    cached = state.get('cached_scores')
+    last_decision = state.get('last_decision', '')
+    force_rejudge = state.get('force_rejudge', False)
+    use_cache = (
+        cached is not None
+        and last_decision == 'DISCARDED'
+        and not force_rejudge
+        and not state.get('adversarial_findings')
+    )
 
-    requests = []
+    # build dimension weights from judge files
     dimension_weights = {}
     for jf in judge_files:
-        prompt = load_judge_prompt(jf)
         meta = parse_judge_frontmatter(jf)
         dimension_weights[meta['dimension']] = meta.get('weight', 1.0)
-        full_prompt = f"{prompt}\n{context_section}\n---\n\nARTIFACT TO EVALUATE:\n\n{artifact_text}\n\n---\n\nyour verdict (PASS or FAIL) and brief critique:"
-        requests.append({
-            'dimension': meta['dimension'],
-            'prompt': full_prompt,
-        })
 
-    request_path = iter_dir / 'judge_request.jsonl'
-    with open(request_path, 'w') as f:
+    if use_cache:
+        # use cached scores -- write them directly as judge_response.jsonl
+        console.print(f"\n[dim]using cached scores from iteration {cached.get('iteration', '?')} (artifact unchanged since last adoption)[/dim]")
+        response_path = iter_dir / 'judge_response.jsonl'
+        with open(response_path, 'w') as f:
+            for dim, verdict in cached.get('scores', {}).items():
+                f.write(json.dumps({'dimension': dim, 'verdict': verdict}) + '\n')
+        prompt_files = []
+    else:
+        # normal flow: write judge prompts for all dimensions
+        context_section = build_context_section(context_path)
+
+        requests = []
+        for jf in judge_files:
+            prompt = load_judge_prompt(jf)
+            meta = parse_judge_frontmatter(jf)
+            full_prompt = f"{prompt}\n{context_section}\n---\n\nARTIFACT TO EVALUATE:\n\n{artifact_text}\n\n---\n\nyour verdict (PASS or FAIL) and brief critique:"
+            requests.append({
+                'dimension': meta['dimension'],
+                'prompt': full_prompt,
+            })
+
+        request_path = iter_dir / 'judge_request.jsonl'
+        with open(request_path, 'w') as f:
+            for r in requests:
+                f.write(json.dumps(r) + "\n")
+
+        # write per-dimension prompt files for agent access
+        prompt_files = []
         for r in requests:
-            f.write(json.dumps(r) + "\n")
-
-    # write per-dimension prompt files for agent access
-    prompt_files = []
-    for r in requests:
-        prompt_path = iter_dir / f'judge_prompt_{r["dimension"]}.md'
-        prompt_path.write_text(r['prompt'])
-        prompt_files.append(prompt_path)
+            prompt_path = iter_dir / f'judge_prompt_{r["dimension"]}.md'
+            prompt_path.write_text(r['prompt'])
+            prompt_files.append(prompt_path)
 
     # save state (carry forward adversarial_findings if present)
     new_state = {
@@ -459,21 +498,29 @@ def score_before_mode(artifact_path: Path, dimensions_path: Path, judge_dir: Pat
         'artifact_snapshot': artifact_text,
         'dimension_weights': dimension_weights,
         'context_path': str(context_path) if context_path else None,
+        'used_cache': use_cache,
     }
     prev_findings = state.get('adversarial_findings', '')
     if prev_findings:
         new_state['adversarial_findings'] = prev_findings
+    # preserve cached_scores through iterations
+    if cached and not force_rejudge:
+        new_state['cached_scores'] = cached
     save_state(new_state)
 
     console.print(f"\n[bold]iteration {iteration}[/bold]")
-    console.print(f"[green]judge request written to {request_path} ({len(requests)} dimensions)[/green]")
-    console.print(f"\n[bold]next:[/bold] launch one agent per dimension to judge in parallel.")
-    console.print(f"  each agent reads its prompt file and returns a PASS/FAIL verdict.")
-    console.print(f"  prompt files:")
-    for pf in prompt_files:
-        console.print(f"    {pf}")
-    console.print(f"\n  collect verdicts into: {iter_dir / 'judge_response.jsonl'}")
-    console.print(f'  format: {{"dimension": "name", "verdict": "PASS: reason"}}')
+    if use_cache:
+        console.print(f"[green]cached judge scores written to {iter_dir / 'judge_response.jsonl'}[/green]")
+        console.print(f"\n[bold]next:[/bold] run score-after (no judging needed -- cached scores used)")
+    else:
+        console.print(f"[green]judge request written to {iter_dir / 'judge_request.jsonl'} ({len(judge_files)} dimensions)[/green]")
+        console.print(f"\n[bold]next:[/bold] launch one agent per dimension to judge in parallel.")
+        console.print(f"  each agent reads its prompt file and returns a PASS/FAIL verdict.")
+        console.print(f"  prompt files:")
+        for pf in prompt_files:
+            console.print(f"    {pf}")
+        console.print(f"\n  collect verdicts into: {iter_dir / 'judge_response.jsonl'}")
+        console.print(f'  format: {{"dimension": "name", "verdict": "PASS: reason"}}')
 
 
 def score_after_mode(judge_dir: Path, improve_path: Path):
@@ -743,8 +790,25 @@ def verdict_mode(artifact_path: Path, stall_threshold: int = 3, adversarial_inte
         color = "green" if verdict == "PASS" else "red"
         console.print(f"  {dim}: {before} -> [{color}]{verdict}[/{color}]")
 
-    # update state for next iteration
-    save_state({'iteration': iteration, 'phase': 'completed'})
+    # update state for next iteration (with score cache for variance reduction)
+    next_state = {'iteration': iteration, 'phase': 'completed', 'last_decision': decision}
+    if decision == 'ADOPTED':
+        # cache the after-scores as the new baseline (artifact changed)
+        # rebuild full verdict strings from judge_response_after + carried scores
+        cached_verdicts = {}
+        for dim, verdict in state.get('llm_scores_before', {}).items():
+            cached_verdicts[dim] = f"{verdict}: carried from before-scores"
+        for r in responses:
+            cached_verdicts[r['dimension']] = r.get('verdict', 'FAIL')
+        next_state['cached_scores'] = {
+            'iteration': iteration,
+            'scores': cached_verdicts,
+        }
+    else:
+        # preserve existing cache (artifact unchanged)
+        if state.get('cached_scores'):
+            next_state['cached_scores'] = state['cached_scores']
+    save_state(next_state)
 
     console.print(f"\n[dim]logged to {RUNS_DIR / 'log.jsonl'}[/dim]")
 
@@ -768,6 +832,29 @@ def verdict_mode(artifact_path: Path, stall_threshold: int = 3, adversarial_inte
                 "  - run human checkpoint review",
                 title="SCORE PLATEAU", border_style="yellow"
             ))
+
+    # ceiling detection: all dimensions PASS + mutation discarded
+    all_pass = all(v == "PASS" for v in llm_scores_after.values())
+    if all_pass and decision == "DISCARDED":
+        ceiling_lines = ["all dimensions are passing and mutation was discarded."]
+        # surface adversarial findings if available
+        adv_log_path = RUNS_DIR / 'adversarial_log.jsonl'
+        if adv_log_path.exists():
+            adv_entries = []
+            with open(adv_log_path) as f:
+                for line in f:
+                    if line.strip():
+                        adv_entries.append(json.loads(line))
+            if adv_entries:
+                latest = adv_entries[-1]
+                ceiling_lines.append(f"\nadversarial findings (iter {latest['iteration']}) suggest gaps:")
+                ceiling_lines.append(f"  {latest['summary'][:200]}")
+        ceiling_lines.append("\nconsider: add new dimensions from adversarial findings, or stop the loop.")
+        console.print(Panel(
+            "\n".join(ceiling_lines),
+            title="CEILING REACHED -- ALL DIMENSIONS PASSING",
+            border_style="bright_yellow",
+        ))
 
     # adversarial pass signal
     if adversarial_interval > 0 and iteration > 0 and iteration % adversarial_interval == 0:
@@ -882,6 +969,17 @@ def adversarial_process_mode():
     }
     log_entry(entry)
 
+    # persist full findings to adversarial log (accumulates across iterations)
+    adv_log_path = RUNS_DIR / 'adversarial_log.jsonl'
+    adv_entry = {
+        'iteration': iteration,
+        'timestamp': datetime.now().isoformat(),
+        'summary': summary,
+        'findings': findings_text,
+    }
+    with open(adv_log_path, 'a') as f:
+        f.write(json.dumps(adv_entry) + '\n')
+
     # save findings to state for next mutation request
     save_state({
         'iteration': iteration,
@@ -889,7 +987,7 @@ def adversarial_process_mode():
         'adversarial_findings': findings_text,
     })
 
-    console.print(f"\n[green]adversarial findings saved to state and log[/green]")
+    console.print(f"\n[green]adversarial findings saved to state, log, and adversarial_log.jsonl[/green]")
     console.print("[dim]next iteration's mutation request will include these findings[/dim]")
 
 
@@ -985,8 +1083,19 @@ def generate_report(log_path: Path, judge_dir: Optional[Path]):
             dt.add_row(dim, f"{p_obs:.2f}", f"{theta:.2f}", f"{meta['tpr']:.2f}", f"{meta['tnr']:.2f}")
         console.print(dt)
 
-    # adversarial events
-    if adversarials:
+    # adversarial events (prefer full log if available, fallback to log.jsonl summaries)
+    adv_log_path = RUNS_DIR / 'adversarial_log.jsonl'
+    if adv_log_path.exists():
+        adv_entries = []
+        with open(adv_log_path) as f:
+            for line in f:
+                if line.strip():
+                    adv_entries.append(json.loads(line))
+        if adv_entries:
+            console.print(f"\n[bold]adversarial passes ({len(adv_entries)} total):[/bold]")
+            for adv in adv_entries:
+                console.print(f"  iter {adv.get('iteration', '?')}: {adv.get('summary', 'no summary')[:120]}")
+    elif adversarials:
         console.print("\n[bold]adversarial passes:[/bold]")
         for adv in adversarials:
             console.print(f"  iter {adv.get('iteration', '?')}: {adv.get('summary', 'no summary')[:120]}")
@@ -1071,6 +1180,8 @@ def main():
     p_sb.add_argument('--judge-dir', default='judge_prompts/')
     p_sb.add_argument('--improve', required=True)
     p_sb.add_argument('--context', help='optional path to context.md (ground truth facts)')
+    p_sb.add_argument('--force-rejudge', action='store_true',
+                      help='ignore cached scores and re-judge all dimensions')
 
     # score-after
     p_sa = sub.add_parser('score-after', help='read judge results, select weakest, write mutation request')
@@ -1116,7 +1227,8 @@ def main():
     elif args.command == 'score-before':
         ctx = Path(args.context) if getattr(args, 'context', None) else None
         score_before_mode(Path(args.artifact), Path(args.dimensions),
-                         Path(args.judge_dir), Path(args.improve), ctx)
+                         Path(args.judge_dir), Path(args.improve), ctx,
+                         getattr(args, 'force_rejudge', False))
     elif args.command == 'score-after':
         score_after_mode(Path(args.judge_dir), Path(args.improve))
     elif args.command == 'apply-mutation':
