@@ -1,5 +1,7 @@
 # autorefine
 
+A Claude Code skill.
+
 Score a markdown document. Mutate the weakest part. Keep it only if the
 score went up. Repeat.
 
