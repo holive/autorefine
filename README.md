@@ -11,9 +11,10 @@ quality dimensions and tell PASS from FAIL.
 Claude Code is the LLM, so no API key is needed. Scripts handle data and
 scoring. Claude Code does all the reasoning.
 
-Phase 1 builds one validated judge per quality dimension. Run it once.
-Phase 2 is the autonomous loop: score, mutate, re-judge, keep or discard.
-Run it overnight.
+Phase 1 builds one validated judge per quality dimension. It's interactive --
+you label, audit, and validate alongside Claude Code.
+Phase 2 is the improvement loop: score, mutate, re-judge, keep or discard.
+Claude Code orchestrates each step, so you stay in the conversation.
 
 Requires Python 3.11+, `rich` (`pip install rich`), and Claude Code.
 
