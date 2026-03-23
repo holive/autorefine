@@ -1,24 +1,13 @@
 # autorefine
 
-Autonomous improvement loop for markdown artifacts. You write a rough draft,
-define what "good" looks like, and the system builds LLM judges that are
-validated against your own labels. Then it runs a mutation-and-score loop,
-keeps what scores higher, discards the rest.
+Score a markdown document. Mutate the weakest part. Keep it only if the
+score went up. Repeat.
 
-Business plans, skills, SOPs, technical specs. Anything where you can define
-quality dimensions and tell PASS from FAIL.
+Builds LLM judges from your own labels, no API key needed. Works for business
+plans, skills, SOPs, technical specs -- anything where you can tell PASS from
+FAIL. Claude Code does the reasoning; scripts handle scoring and data.
 
-Claude Code is the LLM, so no API key is needed. Scripts handle data and
-scoring. Claude Code does all the reasoning.
-
-Phase 1 builds one validated judge per quality dimension. It's interactive --
-you label, audit, and validate alongside Claude Code.
-Phase 2 is the improvement loop: score, mutate, re-judge, keep or discard.
-Claude Code orchestrates each step, so you stay in the conversation.
-
-Requires Python 3.11+, `rich` (`pip install rich`), and Claude Code.
-
-Start with `/autorefine [project_path]`.
+`/autorefine [project_path]` -- requires Python 3.11+, `rich`, and Claude Code.
 
 ---
 
