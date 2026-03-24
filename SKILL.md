@@ -219,6 +219,15 @@ python3 $SKILL_DIR/phase2/run.py report
 python3 $SKILL_DIR/phase2/run.py review-checkpoints --improve improve.md
 ```
 
+**Scan for invented data:**
+```bash
+python3 $SKILL_DIR/phase2/run.py placeholders --artifact artifact.md
+```
+Reports all `[PLACEHOLDER: ...]` tags in the artifact -- invented data that
+needs to be replaced with real information before finalizing the document.
+Mutations are instructed to tag any fabricated specifics (names, numbers, dates,
+teams) with this format automatically.
+
 ---
 
 ## Project Directory Layout

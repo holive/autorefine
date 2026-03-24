@@ -609,6 +609,14 @@ JUDGE CRITIQUE:
 TASK:
 make one targeted change to improve "{targeted}". do not modify any hard-constrained sections.{context_instruction}{adv_instruction}
 
+INVENTED DATA RULE:
+if you invent specific information not present in the current artifact (names, numbers, dates, teams, metrics), wrap it in: [PLACEHOLDER: what real data is needed]
+examples:
+  - "[PLACEHOLDER: actual platform engineering lead name]"
+  - "[PLACEHOLDER: real Q4 incident count from PagerDuty]"
+  - "[PLACEHOLDER: confirmed sprint planning date]"
+do NOT tag information already in the artifact, from GROUND TRUTH, or generic structural text.
+
 output format (use these exact delimiters):
 ---ARTIFACT START---
 [the full revised artifact]
@@ -915,6 +923,9 @@ would raise. for each objection:
 focus on gaps the normal rubric judges don't catch -- contradictions, unsupported
 assumptions, logic gaps, missing critical info for the target reader.
 
+if you reference specific data that does not exist in the artifact, wrap it in:
+  [PLACEHOLDER: what real data is needed]
+
 OUTPUT FORMAT:
 for each objection:
 ### Objection N: [title]
@@ -1156,6 +1167,42 @@ def review_checkpoints(log_path: Path, improve_path: Path):
             console.print("[yellow]reverted to approved[/yellow]")
 
 
+def placeholders_mode(artifact_path: Path):
+    """scan artifact for [PLACEHOLDER: ...] tags and report"""
+    if not artifact_path.exists():
+        console.print(f"[red]artifact not found: {artifact_path}[/red]")
+        sys.exit(1)
+
+    text = artifact_path.read_text()
+    pattern = r'\[PLACEHOLDER:\s*([^\]]+)\]'
+    matches = []
+
+    for line_num, line in enumerate(text.split('\n'), start=1):
+        for m in re.finditer(pattern, line):
+            matches.append({
+                'line': line_num,
+                'description': m.group(1).strip(),
+                'context': line.strip()
+            })
+
+    if not matches:
+        console.print("[green]no placeholders found in artifact[/green]")
+        return
+
+    console.print(f"\n[bold yellow]{len(matches)} placeholder(s) need real data[/bold yellow]\n")
+
+    table = Table(box=box.ROUNDED)
+    table.add_column("line", style="cyan", width=6)
+    table.add_column("needs", style="yellow")
+    table.add_column("context", style="dim", max_width=60)
+
+    for m in matches:
+        ctx = m['context'][:80] + "..." if len(m['context']) > 80 else m['context']
+        table.add_row(str(m['line']), m['description'], ctx)
+
+    console.print(table)
+
+
 # ============================================================================
 # cli
 # ============================================================================
@@ -1220,6 +1267,10 @@ def main():
     p_rc.add_argument('--log', default='runs/log.jsonl')
     p_rc.add_argument('--improve', required=True)
 
+    # placeholders
+    p_ph = sub.add_parser('placeholders', help='scan artifact for [PLACEHOLDER: ...] tags')
+    p_ph.add_argument('--artifact', required=True, help='path to artifact.md')
+
     args = parser.parse_args()
 
     if args.command == 'init':
@@ -1244,6 +1295,8 @@ def main():
         generate_report(Path(args.log), Path(args.judge_dir))
     elif args.command == 'review-checkpoints':
         review_checkpoints(Path(args.log), Path(args.improve))
+    elif args.command == 'placeholders':
+        placeholders_mode(Path(args.artifact))
     else:
         parser.print_help()
         sys.exit(1)
