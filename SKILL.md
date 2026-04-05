@@ -26,9 +26,17 @@ judges excerpts, and proposes mutations directly.
 
 ---
 
-## Quick Start
+## Where to Start
 
-### Phase 1 -- Judge Setup (run once per domain)
+- First time? No `examples/dimensions.md` yet --> Phase 1 below
+- Judges validated, ready to loop             --> Phase 2 below
+- Mid-loop, need reports                      --> Reports and Checkpoints below
+
+---
+
+# ============================================================
+# Phase 1 -- Judge Setup (run once per domain)
+# ============================================================
 
 1. **Write `improve.md`** in the project directory: fill in the 4 required fields
    (what is being improved, what good looks like, hard constraints, end-to-end
@@ -129,7 +137,9 @@ judges excerpts, and proposes mutations directly.
    python3 $SKILL_DIR/phase2/run.py init --artifact artifact.md --improve improve.md
    ```
 
-### Phase 2 -- Autonomous Loop
+# ============================================================
+# Phase 2 -- Autonomous Loop
+# ============================================================
 
 Claude Code orchestrates the loop. Each iteration has 4 steps:
 
@@ -207,7 +217,9 @@ Findings are saved to state and included in the next iteration's mutation reques
 
 **Repeat** steps A-F for each iteration.
 
-### Reports and Checkpoints
+# ============================================================
+# Reports and Checkpoints
+# ============================================================
 
 **Morning report:**
 ```bash
