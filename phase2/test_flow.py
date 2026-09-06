@@ -271,13 +271,17 @@ def test_full_loop():
         state = t.load_state()
         check(state['phase'] == 'awaiting_judge_after', f"phase should be awaiting_judge_after, got {state['phase']}")
 
-        # verify context in after-judge prompt
+        # verify context in every after-judge prompt; all dimensions are
+        # re-evaluated because a targeted mutation can regress another one.
         ajp = t.iter_dir(1) / 'judge_after_prompt_number_consistency.md'
         check(t.file_contains(ajp, 'GROUND TRUTH'), "after-judge prompt should contain GROUND TRUTH")
+        ajp_risk = t.iter_dir(1) / 'judge_after_prompt_risk_quality.md'
+        check(ajp_risk.exists(), "after-judge should request every required dimension")
 
         # step F: simulate after-judge + verdict
         t.write_after_judge_response(1, {
             'number_consistency': 'PASS: numbers now reconciled with cup count',
+            'risk_quality': 'PASS: risks still have concrete mitigations',
         })
         result = t.run('verdict', '--artifact', 'artifact.md', '--adversarial-interval', '5')
 
@@ -310,11 +314,27 @@ def test_full_loop():
 
             t.run('apply-mutation', '--artifact', 'artifact.md')
 
-            # after-judge: regression on targeted dim
+            # after-judge: regression on targeted dim; all dimensions still
+            # need a fresh verdict.
             targeted = t.load_state().get('targeted_dimension', 'number_consistency')
-            t.write_after_judge_response(i, {
-                targeted: f'FAIL: regression detected in {targeted}',
-            })
+            after_verdicts = {
+                'number_consistency': 'PASS: numbers consistent',
+                'risk_quality': 'PASS: risks adequate',
+            }
+            after_verdicts[targeted] = f'FAIL: regression detected in {targeted}'
+            t.write_after_judge_response(i, after_verdicts)
+            # write_after_judge_response emits one entry per dimension
+            if i == 2:
+                incomplete_path = t.iter_dir(i) / 'judge_response_after.jsonl'
+                incomplete_path.write_text(
+                    json.dumps({'dimension': targeted, 'verdict': 'FAIL: incomplete response check'}) + '\n'
+                )
+                incomplete = t.run('verdict', '--artifact', 'artifact.md', check=False)
+                check(incomplete.returncode != 0, "incomplete after-judge response should fail closed")
+                candidate_text = (t.tmpdir / 'artifact.md').read_text()
+                check('50 cups' in candidate_text and 'Risk Register' in candidate_text,
+                      "incomplete response should leave candidate available for a safe retry")
+                t.write_after_judge_response(i, after_verdicts)
 
             result = t.run('verdict', '--artifact', 'artifact.md',
                            '--stall-threshold', '3', '--adversarial-interval', '5')
@@ -361,9 +381,12 @@ def test_full_loop():
         t.run('apply-mutation', '--artifact', 'artifact.md')
 
         targeted = t.load_state().get('targeted_dimension', 'risk_quality')
-        t.write_after_judge_response(5, {
-            targeted: f'PASS: {targeted} improved',
-        })
+        after_verdicts = {
+            'number_consistency': 'PASS: numbers consistent',
+            'risk_quality': 'PASS: risks adequate',
+        }
+        after_verdicts[targeted] = f'PASS: {targeted} improved'
+        t.write_after_judge_response(5, after_verdicts)
 
         result = t.run('verdict', '--artifact', 'artifact.md',
                         '--stall-threshold', '3', '--adversarial-interval', '5')
@@ -442,7 +465,12 @@ def test_full_loop():
         t.run('apply-mutation', '--artifact', 'artifact.md')
 
         targeted = t.load_state().get('targeted_dimension', 'number_consistency')
-        t.write_after_judge_response(6, {targeted: f'PASS: {targeted} ok'})
+        after_verdicts = {
+            'number_consistency': 'PASS: consistent',
+            'risk_quality': 'PASS: adequate',
+        }
+        after_verdicts[targeted] = f'PASS: {targeted} ok'
+        t.write_after_judge_response(6, after_verdicts)
 
         t.run('verdict', '--artifact', 'artifact.md',
               '--stall-threshold', '3', '--adversarial-interval', '5')
@@ -466,14 +494,67 @@ def test_full_loop():
               "iter 7 mutation request should NOT contain adversarial findings (one-shot)")
 
         # also verify no context (we omitted --context this iteration)
-        check(not t.file_contains(mr7, 'GROUND TRUTH'),
-              "iter 7 mutation request should NOT contain context (--context omitted)")
+        check(not t.file_contains(mr7, 'Lemon cost'),
+              "iter 7 mutation request should NOT contain supplied context (--context omitted)")
 
         # clean up iter 7 (don't need to finish it)
         # just reset state so report works
         state = t.load_state()
         state['phase'] = 'completed'
         (t.tmpdir / 'runs' / 'current_iteration.json').write_text(json.dumps(state, indent=2))
+
+        # ================================================================
+        # ITERATION 8: composite improvement cannot hide a dimension regression
+        # ================================================================
+        print("\n--- iteration 8: reject hidden regression ---")
+        t.run('score-before', '--artifact', 'artifact.md', '--improve', 'improve.md')
+        t.write_judge_response(8, {
+            'number_consistency': 'FAIL: needs reconciliation',
+            'risk_quality': 'PASS: risks adequate',
+        })
+        t.run('score-after', '--judge-dir', 'judge_prompts/', '--improve', 'improve.md')
+        t.write_mutation_response(8, t.fixed_artifact, "trade number consistency for a risk edit")
+        t.run('apply-mutation', '--artifact', 'artifact.md')
+        t.write_after_judge_response(8, {
+            'number_consistency': 'PASS: reconciled',
+            'risk_quality': 'FAIL: mitigation regressed',
+        })
+        t.run('verdict', '--artifact', 'artifact.md', '--adversarial-interval', '0')
+        iter8 = [e for e in t.load_log() if e.get('iteration') == 8][-1]
+        check(iter8['decision'] == 'DISCARDED',
+              "composite improvement with a dimension regression must be discarded")
+        check(iter8['llm_regressions'] == ['risk_quality'],
+              "log should identify the regressed dimension")
+
+        # ================================================================
+        # ITERATION 9: cheap invariant regression cannot be hidden by score gain
+        # ================================================================
+        print("\n--- iteration 9: reject hidden cheap-check regression ---")
+        t.run('score-before', '--artifact', 'artifact.md', '--improve', 'improve.md')
+        t.write_judge_response(9, {
+            'number_consistency': 'FAIL: needs reconciliation',
+            'risk_quality': 'PASS: risks adequate',
+        })
+        t.run('score-after', '--judge-dir', 'judge_prompts/', '--improve', 'improve.md')
+        mutated_no_risk = (
+            "# Lemonade Stand Business Plan\n\n"
+            "Revenue: $100/day (50 cups x $2) [ASSUMPTION]\n"
+            "Costs: $30/day\n"
+            "Profit: $70/day\n\n"
+            "## Appendix: Notes\n\nDo not modify this section.\n"
+        )
+        t.write_mutation_response(9, mutated_no_risk, "removed the risk register")
+        t.run('apply-mutation', '--artifact', 'artifact.md')
+        t.write_after_judge_response(9, {
+            'number_consistency': 'PASS: reconciled',
+            'risk_quality': 'PASS: risks adequate',
+        })
+        t.run('verdict', '--artifact', 'artifact.md', '--adversarial-interval', '0')
+        iter9 = [e for e in t.load_log() if e.get('iteration') == 9][-1]
+        check(iter9['decision'] == 'DISCARDED',
+              "composite improvement with a cheap-check regression must be discarded")
+        check(iter9['cheap_regressions'] == ['risk_register_exists'],
+              "log should identify the regressed cheap check")
 
         # ================================================================
         # REPORT
@@ -507,6 +588,7 @@ def test_full_loop():
         iter10.mkdir(parents=True, exist_ok=True)
         with open(iter10 / 'judge_response_after.jsonl', 'w') as f:
             f.write(json.dumps({'dimension': 'risk_quality', 'verdict': 'PASS: ok'}) + '\n')
+            f.write(json.dumps({'dimension': 'number_consistency', 'verdict': 'PASS: ok'}) + '\n')
 
         result = t.run('verdict', '--artifact', 'artifact.md',
                         '--adversarial-interval', '0')

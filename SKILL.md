@@ -104,13 +104,16 @@ judges excerpts, and proposes mutations directly.
    if codex is unavailable, claude code generates directly (note the potential
    for same-model bias in observations).
 
-6. **Label synthetic examples** -- recommended: auto-accept model labels.
+6. **Label synthetic examples** -- synthetic labels can be retained as weak
+   training data, but model output is never human gold. For independent
+   validation, review the examples interactively (or use a real excerpt set)
+   and preserve the recorded provenance.
    ```bash
    python3 $SKILL_DIR/phase1/3_label.py --source synthetic --auto-accept --input examples/unlabeled.jsonl
    ```
-   This accepts model labels as human labels and prints a summary table.
-   Use interactive mode (without `--auto-accept`) only if you want to
-   independently review every example.
+   This stores `label` with `label_provenance: model_auto`; it does not write a
+   `human_label`. Use interactive mode (without `--auto-accept`) when you want
+   human labels that can support an independent held-out test.
 
 7. **Validate each judge** -- Claude Code runs this step automatically.
    No manual commands needed. For each dimension, Claude Code will:
@@ -121,12 +124,15 @@ judges excerpts, and proposes mutations directly.
       ```
    b. Read each example in the dev batch, judge it, write results
    c. Run the score script to compute TPR/TNR
-   d. If there are disagreements, show them to the user and offer to
-      align labels with the judge:
+   d. If there are disagreements, keep the reference labels unchanged. On the
+      dev split, ask for an explicit independent adjudication when useful:
       ```bash
-      python3 $SKILL_DIR/phase1/4_validate_judge.py --mode flip-to-judge --dimension <dim> --split dev
+      python3 $SKILL_DIR/phase1/4_validate_judge.py --mode adjudicate --dimension <dim> --split dev
       ```
-   e. If dev passes (TPR >= 80%, TNR >= 80%), repeat b-d with test split
+      The held-out test split is immutable and never accepts automatic
+      label-flipping or adjudication updates.
+   e. If dev passes (TPR >= 80%, TNR >= 80%), repeat scoring with the
+      independently labeled test split
    f. Report final go/no-go per dimension
 
    Judges need TPR >= 80% AND TNR >= 80% on point estimates. Small sample
@@ -186,10 +192,11 @@ if codex is unavailable, claude code generates the mutation directly.
 python3 $SKILL_DIR/phase2/run.py apply-mutation \
   --artifact artifact.md
 ```
-Applies mutation, writes a judge request for the **targeted dimension only**
+Applies mutation, writes judge requests for **all required dimensions**
 (`runs/iter_NNN/judge_after_prompt_<dim>.md`). Claude Code launches one agent
-to re-judge that dimension. Non-targeted dimensions carry forward their
-before-scores -- this eliminates judge variance on unrelated dimensions.
+per dimension to re-judge the mutated artifact. The verdict requires a
+complete response set and rejects any regression in a required dimension or
+cheap check before considering the composite score.
 Verdict collected into `runs/iter_NNN/judge_response_after.jsonl`.
 
 **Step F -- Verdict:**

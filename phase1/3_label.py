@@ -365,6 +365,7 @@ def label_real_excerpts(
                         "human_label": label,
                         "critique": critique,
                         "source": "real",
+                        "label_provenance": "human",
                         "model_label": None,
                         "model_reason": None
                     }
@@ -395,7 +396,11 @@ def label_synthetic_examples(
     output_path: Path,
     merge_with_real: Optional[Path] = None
 ):
-    """interactive labeling for synthetic examples."""
+    """interactive labeling for synthetic examples.
+
+    A label entered by the reviewer is recorded as human provenance.  This is
+    intentionally separate from the model suggestion shown alongside it.
+    """
     all_examples = examples  # keep full list for per-dimension counting
     # resume support: skip already-labeled examples
     existing = load_existing_labels(output_path)
@@ -530,6 +535,7 @@ def label_synthetic_examples(
                     "human_label": label,
                     "critique": critique,
                     "source": "synthetic",
+                    "label_provenance": "human",
                     "model_label": model_label,
                     "model_reason": model_reason
                 }
@@ -575,7 +581,12 @@ def label_synthetic_examples(
 
 
 def auto_accept_synthetic(examples: List[Dict], output_path: Path):
-    """auto-accept model labels as human labels without interactive review."""
+    """save model labels for training without misrepresenting them as human gold.
+
+    Auto labels remain usable as weak/reference labels, but deliberately omit
+    ``human_label`` and carry explicit model provenance.  Phase 1 validation
+    therefore cannot treat these examples as independent human validation.
+    """
     existing = load_existing_labels(output_path)
     already_done = len(existing)
     if already_done >= len(examples):
@@ -597,9 +608,10 @@ def auto_accept_synthetic(examples: List[Dict], output_path: Path):
         label_data = {
             "text": ex["text"],
             "dimension": d,
-            "human_label": l,
+            "label": l,
             "critique": ex.get("model_reason", ""),
             "source": "synthetic",
+            "label_provenance": "model_auto",
             "model_label": l,
             "model_reason": ex.get("model_reason", "")
         }
@@ -711,6 +723,7 @@ def batch_label_real(
                 "human_label": label_str,
                 "critique": critique,
                 "source": "real",
+                "label_provenance": "human",
                 "model_label": None,
                 "model_reason": None,
             }
@@ -872,6 +885,7 @@ def assisted_label_real(
                         "human_label": ml,
                         "critique": mr,
                         "source": "real",
+                        "label_provenance": "human_assisted_accept",
                         "model_label": ml,
                         "model_reason": mr,
                     }
@@ -891,6 +905,7 @@ def assisted_label_real(
                     "human_label": label,
                     "critique": critique,
                     "source": "real",
+                    "label_provenance": "human_adjudicated",
                     "model_label": ml,
                     "model_reason": mr,
                 }
@@ -920,6 +935,7 @@ def assisted_label_real(
                             "human_label": label,
                             "critique": critique,
                             "source": "real",
+                            "label_provenance": "human",
                             "model_label": None,
                             "model_reason": None,
                         }

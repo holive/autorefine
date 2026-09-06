@@ -10,8 +10,8 @@ modes:
   --score-before --artifact PATH           run cheap checks, write judge request
   --score-after                            read judge results, compute composite,
                                            select weakest, write mutation request
-  --apply-mutation                         read mutation response, write judge
-                                           request for mutated version
+  --apply-mutation                         read mutation response, write all-
+                                           dimension judge requests
   --verdict                                read after-judge results, keep/discard, log
   --report PATH                            morning report from log
   --review-checkpoints PATH --improve PATH review queued checkpoints
@@ -454,6 +454,7 @@ def score_before_mode(artifact_path: Path, dimensions_path: Path, judge_dir: Pat
     for jf in judge_files:
         meta = parse_judge_frontmatter(jf)
         dimension_weights[meta['dimension']] = meta.get('weight', 1.0)
+    required_dimensions = sorted(dimension_weights)
 
     if use_cache:
         # use cached scores -- write them directly as judge_response.jsonl
@@ -497,6 +498,7 @@ def score_before_mode(artifact_path: Path, dimensions_path: Path, judge_dir: Pat
         'cheap_results': cheap_results,
         'artifact_snapshot': artifact_text,
         'dimension_weights': dimension_weights,
+        'required_dimensions': required_dimensions,
         'context_path': str(context_path) if context_path else None,
         'used_cache': use_cache,
     }
@@ -540,6 +542,26 @@ def score_after_mode(judge_dir: Path, improve_path: Path):
         for line in f:
             if line.strip():
                 responses.append(json.loads(line))
+
+    required_dimensions = set(state.get('required_dimensions', state.get('dimension_weights', {})))
+    response_dimensions = [r.get('dimension') for r in responses]
+    valid_response_dimensions = [d for d in response_dimensions if isinstance(d, str)]
+    invalid = [repr(d) for d in response_dimensions if not isinstance(d, str) or not d]
+    missing = sorted(required_dimensions - set(valid_response_dimensions))
+    duplicates = sorted({d for d in valid_response_dimensions if valid_response_dimensions.count(d) > 1})
+    unknown = sorted({d for d in valid_response_dimensions if d not in required_dimensions})
+    if missing or duplicates or unknown or invalid:
+        problems = []
+        if missing:
+            problems.append(f"missing: {', '.join(missing)}")
+        if duplicates:
+            problems.append(f"duplicates: {', '.join(duplicates)}")
+        if unknown:
+            problems.append(f"unknown: {', '.join(unknown)}")
+        if invalid:
+            problems.append(f"invalid dimensions: {', '.join(invalid)}")
+        console.print("[bold red]before-judge response is incomplete or invalid:[/bold red] " + '; '.join(problems))
+        raise SystemExit(1)
 
     # build scores + critiques
     llm_scores = {}
@@ -644,7 +666,7 @@ output format (use these exact delimiters):
 
 def apply_mutation_mode(artifact_path: Path, dimensions_path: Path, judge_dir: Path,
                         context_path: Optional[Path] = None):
-    """read mutation response, apply to artifact, write judge request for after-scoring"""
+    """apply mutation and request a fresh verdict for every required dimension."""
     state = load_state()
     iteration = state['iteration']
     iter_dir = RUNS_DIR / f'iter_{iteration:03d}'
@@ -683,8 +705,9 @@ def apply_mutation_mode(artifact_path: Path, dimensions_path: Path, judge_dir: P
     dims_config = parse_dimensions_md(dimensions_path)
     cheap_results_after = run_cheap_checks(new_artifact, dims_config['cheap_checks'])
 
-    # write judge request for targeted dimension only (reduces variance on non-targeted dims)
-    targeted = state.get('targeted_dimension', '')
+    # Re-score every required dimension after an arbitrary mutation. A change
+    # aimed at one dimension can regress another, so carrying old scores
+    # forward would make the composite acceptance decision unsound.
     judge_files = sorted(judge_dir.glob('*.md'))
     judge_files = [f for f in judge_files if not any(s in f.name for s in ['_batch', '_results', '_truth', '_split'])]
 
@@ -697,8 +720,6 @@ def apply_mutation_mode(artifact_path: Path, dimensions_path: Path, judge_dir: P
     requests = []
     for jf in judge_files:
         meta = parse_judge_frontmatter(jf)
-        if meta['dimension'] != targeted:
-            continue
         prompt = load_judge_prompt(jf)
         full_prompt = f"{prompt}\n{context_section}\n---\n\nARTIFACT TO EVALUATE:\n\n{new_artifact}\n\n---\n\nyour verdict (PASS or FAIL) and brief critique:"
         requests.append({
@@ -722,17 +743,19 @@ def apply_mutation_mode(artifact_path: Path, dimensions_path: Path, judge_dir: P
         'phase': 'awaiting_judge_after',
         'mutation_rationale': rationale,
         'new_artifact': new_artifact,
+        'mutation_hash': hashlib.sha256(new_artifact.encode('utf-8')).hexdigest(),
         'cheap_results_after': cheap_results_after,
     })
     save_state(state)
 
-    console.print(f"[green]after-judge request: targeted dimension only ({targeted})[/green]")
-    console.print(f"\n[bold]next:[/bold] launch one agent to re-judge the targeted dimension.")
+    required_dimensions = state.get('required_dimensions', [r['dimension'] for r in requests])
+    console.print(f"[green]after-judge request: all required dimensions ({len(required_dimensions)})[/green]")
+    console.print(f"\n[bold]next:[/bold] launch one agent per dimension to re-judge the mutated artifact.")
     console.print(f"  prompt file:")
     for pf in prompt_files:
         console.print(f"    {pf}")
     console.print(f"\n  collect verdict into: {iter_dir / 'judge_response_after.jsonl'}")
-    console.print(f"  [dim]non-targeted dimensions carry forward their before-scores[/dim]")
+    console.print(f"  [dim]all required dimensions must be present exactly once[/dim]")
 
 
 def verdict_mode(artifact_path: Path, stall_threshold: int = 3, adversarial_interval: int = 5):
@@ -752,8 +775,43 @@ def verdict_mode(artifact_path: Path, stall_threshold: int = 3, adversarial_inte
             if line.strip():
                 responses.append(json.loads(line))
 
-    # start with before-scores, then overlay re-judged dimensions
-    llm_scores_after = dict(state.get('llm_scores_before', {}))
+    before_scores = state.get('llm_scores_before', {})
+    required_dimensions = set(state.get('required_dimensions', before_scores))
+    response_dimensions = [r.get('dimension') for r in responses]
+    valid_response_dimensions = [d for d in response_dimensions if isinstance(d, str)]
+    invalid = [repr(d) for d in response_dimensions if not isinstance(d, str) or not d]
+    duplicates = sorted({d for d in valid_response_dimensions if valid_response_dimensions.count(d) > 1})
+    unknown = sorted({d for d in valid_response_dimensions if d not in required_dimensions})
+    missing = sorted(required_dimensions - set(valid_response_dimensions))
+    candidate_hash = state.get('mutation_hash')
+    current_hash = hashlib.sha256(artifact_path.read_text().encode('utf-8')).hexdigest()
+    if candidate_hash and current_hash != candidate_hash:
+        console.print("[bold red]candidate artifact changed after judging; re-apply the mutation before retrying.[/bold red]")
+        raise SystemExit(1)
+    if duplicates or unknown or missing or invalid:
+        problems = []
+        if missing:
+            problems.append(f"missing: {', '.join(missing)}")
+        if duplicates:
+            problems.append(f"duplicates: {', '.join(duplicates)}")
+        if unknown:
+            problems.append(f"unknown: {', '.join(unknown)}")
+        if invalid:
+            problems.append(f"invalid dimensions: {', '.join(invalid)}")
+        # Keep the candidate in place and require a complete response before
+        # adoption. The candidate hash is checked above on every retry.
+        state['phase'] = 'awaiting_judge_after'
+        state['after_judge_error'] = '; '.join(problems)
+        save_state(state)
+        console.print(
+            "[bold red]after-judge response is incomplete or invalid:[/bold red] "
+            + '; '.join(problems)
+        )
+        console.print("[yellow]candidate retained; provide exactly one verdict for every required dimension and retry.[/yellow]")
+        raise SystemExit(1)
+
+    # All required dimensions were re-judged; no scores are carried forward.
+    llm_scores_after = {}
     for r in responses:
         verdict_text = r.get('verdict', 'FAIL')
         is_pass = verdict_text.strip().upper().startswith('PASS')
@@ -765,8 +823,19 @@ def verdict_mode(artifact_path: Path, stall_threshold: int = 3, adversarial_inte
     composite_before = state['composite_before']
     delta = composite_after - composite_before
 
+    llm_regressions = sorted(
+        dim for dim, before in before_scores.items()
+        if before == 'PASS' and llm_scores_after.get(dim) == 'FAIL'
+    )
+    cheap_before = state.get('cheap_results', {})
+    cheap_missing = sorted(set(cheap_before) - set(cheap_results_after))
+    cheap_regressions = sorted(
+        name for name, before in cheap_before.items()
+        if before == 'PASS' and cheap_results_after.get(name) == 'FAIL'
+    )
+
     # keep or discard (strict: must be strictly better)
-    if composite_after > composite_before:
+    if composite_after > composite_before and not llm_regressions and not cheap_regressions and not cheap_missing:
         decision = "ADOPTED"
         best_path = RUNS_DIR / 'best.md'
         shutil.copy(artifact_path, best_path)
@@ -775,7 +844,16 @@ def verdict_mode(artifact_path: Path, stall_threshold: int = 3, adversarial_inte
         decision = "DISCARDED"
         # restore original
         artifact_path.write_text(state['artifact_snapshot'])
-        console.print(f"[bold red]DISCARDED[/bold red] ({composite_before:.2f} -> {composite_after:.2f}, {delta:.2f})")
+        reasons = []
+        if composite_after <= composite_before:
+            reasons.append("composite did not improve")
+        if llm_regressions:
+            reasons.append(f"dimension regressions: {', '.join(llm_regressions)}")
+        if cheap_regressions:
+            reasons.append(f"cheap-check regressions: {', '.join(cheap_regressions)}")
+        if cheap_missing:
+            reasons.append(f"missing cheap checks: {', '.join(cheap_missing)}")
+        console.print(f"[bold red]DISCARDED[/bold red] ({composite_before:.2f} -> {composite_after:.2f}, {delta:.2f}; {'; '.join(reasons)})")
 
     # log
     entry = {
@@ -787,6 +865,9 @@ def verdict_mode(artifact_path: Path, stall_threshold: int = 3, adversarial_inte
         'cheap_checks': cheap_results_after,
         'llm_scores_before': state.get('llm_scores_before', {}),
         'llm_scores_after': llm_scores_after,
+        'llm_regressions': llm_regressions,
+        'cheap_regressions': cheap_regressions,
+        'cheap_missing': cheap_missing,
         'mutation_rationale': state.get('mutation_rationale', ''),
         'decision': decision,
     }
@@ -802,10 +883,8 @@ def verdict_mode(artifact_path: Path, stall_threshold: int = 3, adversarial_inte
     next_state = {'iteration': iteration, 'phase': 'completed', 'last_decision': decision}
     if decision == 'ADOPTED':
         # cache the after-scores as the new baseline (artifact changed)
-        # rebuild full verdict strings from judge_response_after + carried scores
+        # rebuild full verdict strings from the complete after-judge response
         cached_verdicts = {}
-        for dim, verdict in state.get('llm_scores_before', {}).items():
-            cached_verdicts[dim] = f"{verdict}: carried from before-scores"
         for r in responses:
             cached_verdicts[r['dimension']] = r.get('verdict', 'FAIL')
         next_state['cached_scores'] = {

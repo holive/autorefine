@@ -73,7 +73,8 @@ never wrong. Every LLM judge you don't build is one fewer to validate.
 **Label.** You become the human judge. The script shows sections from your draft
 alongside each dimension, and you decide PASS or FAIL with a brief critique.
 These labels are the gold standard -- everything downstream is validated against
-them.
+them. Model-assisted and auto-generated labels retain their provenance and
+cannot certify the held-out test set.
 
 Three labeling modes:
 - **Interactive** (default): you read each excerpt and decide from scratch.
@@ -158,14 +159,14 @@ three tiers without justification and doesn't compare to competitors" gives
 the mutator more to work with than "pricing is vague." This is a heuristic,
 not a strong signal -- it only matters when fail frequency is tied.
 
-**Re-judge.** Only the targeted dimension gets re-judged. Non-targeted
-dimensions carry forward their before-scores.
+**Re-judge.** Every required dimension gets re-judged after a mutation. A
+mutation aimed at one dimension can regress another, so incomplete responses
+and any per-dimension or cheap-check regression are discarded before composite
+score improvement is considered.
 
-*Why not re-judge everything:* LLM judges have variance. The same text can get
-PASS on one run and FAIL on the next (~5-10% flip rate in testing). If you
-re-judge all 5 dimensions, there's a meaningful chance one flips randomly,
-creating a false improvement or false regression that has nothing to do with
-the mutation. Re-judging only the targeted dimension isolates the signal.
+The before-score cache still reduces variance when an artifact is unchanged;
+after a mutation, completeness and regression checks protect the acceptance
+decision from changes outside the targeted dimension.
 
 **Verdict.** Strictly better = adopt. Equal or worse = discard.
 
@@ -384,7 +385,7 @@ Phase 1:
 | Script | Key args | Purpose |
 |---|---|---|
 | `3_label.py` | `--source real\|synthetic`, `--input`, `[--auto-accept]`, `[--assist]`, `[--batch]`, `[--dry-run]` | interactive, assisted, batch, or auto labeling |
-| `4_validate_judge.py` | `--mode split\|score\|flip-to-judge`, `--dimension` | split, score, align labels |
+| `4_validate_judge.py` | `--mode split\|score\|adjudicate`, `--dimension` | split, score, independently adjudicate dev disagreements |
 
 ### Design decisions
 
@@ -393,7 +394,7 @@ Phase 1:
 | Binary judges + weights | Graded 1-10 scoring | LLMs produce inconsistent numbers; binary is dramatically more reliable (~95% vs ~60% agreement in testing) |
 | One judge per dimension | Multi-dimension judges | compound judges have lower agreement; when they disagree you can't tell which criterion failed |
 | Strict keep/discard | Accept lateral moves | lateral accepts cause drift that accumulates over 10+ iterations; strict improvement is the only safe policy for autonomous loops |
-| Re-judge targeted only | Re-judge all dimensions | eliminates ~5-10% random flip rate on unchanged dimensions; isolates the mutation signal |
+| Re-judge all dimensions after mutation | Re-judge targeted only | catches regressions caused by an arbitrary artifact mutation; cached before-scores still reduce variance on unchanged artifacts |
 | Scheduled adversarial | Continuous adversarial | adversarial costs a full turn and produces findings for one mutation; every-5th balances coverage vs cost |
 | File-based handoff | Direct returns | auditable, survives disconnects, works in subagent sandbox; tradeoff is visibility over convenience |
 | SHA-256 constraints | Diff-based | exact match on frozen sections; no false positives, no complexity |

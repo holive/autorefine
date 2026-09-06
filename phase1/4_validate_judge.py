@@ -8,6 +8,10 @@ this script handles: splitting, prompt building, metrics, go/no-go decisions.
 workflow:
   1. split:  load labels -> 3-way split -> build judge prompt -> export batch
   2. score:  load judge results -> compute TPR/TNR/Wilson CI -> go/no-go
+
+Only independently reviewed labels are eligible for the held-out test. Dev
+disagreements can be explicitly adjudicated; reference labels are never
+automatically changed to agree with a judge.
 """
 
 import argparse
@@ -35,6 +39,12 @@ class LabeledExample:
     dimension: str
     label: bool  # True = PASS, False = FAIL
     source: str
+    provenance: str = "unknown"
+
+    @property
+    def independently_labeled(self) -> bool:
+        """Whether a person supplied this reference label independently."""
+        return self.provenance in {"human", "human_adjudicated"}
 
 
 @dataclass
@@ -81,12 +91,28 @@ def load_labels(labels_path: Path, dimension: str) -> List[LabeledExample]:
                 continue
             obj = json.loads(line)
             if obj.get("dimension") == dimension:
-                raw_label = obj.get("human_label", obj.get("label", "FAIL"))
+                human_label = obj.get("human_label")
+                if isinstance(human_label, str) and human_label.upper() in ("PASS", "FAIL"):
+                    raw_label = human_label.upper()
+                else:
+                    raw_label = obj.get("label", obj.get("model_label"))
+                if isinstance(raw_label, str):
+                    raw_label = raw_label.upper()
+                if raw_label not in ("PASS", "FAIL"):
+                    continue
+
+                # Records without explicit provenance are ambiguous (they may
+                # have been model-assisted or auto-accepted), so they cannot
+                # certify a held-out result until relabeled.
+                provenance = obj.get("label_provenance")
+                if not provenance:
+                    provenance = "legacy_unverified"
                 examples.append(LabeledExample(
                     text=obj["text"],
                     dimension=obj["dimension"],
-                    label=raw_label == "PASS" if isinstance(raw_label, str) else bool(raw_label),
-                    source=obj.get("source", "unknown")
+                    label=raw_label == "PASS",
+                    source=obj.get("source", "unknown"),
+                    provenance=provenance,
                 ))
     return examples
 
@@ -117,7 +143,12 @@ def load_dimension_definition(dimensions_path: Path, dimension: str) -> str:
 
 
 def create_three_way_split(examples: List[LabeledExample]) -> Split:
-    """split examples into train/dev/test with stratification."""
+    """split examples into train/dev/test with an independent held-out test.
+
+    Model-generated labels can help build a prompt in train/dev, but are never
+    placed in test.  This keeps judge tuning from turning synthetic agreement
+    into a claim of independent validation.
+    """
     pass_examples = [e for e in examples if e.label]
     fail_examples = [e for e in examples if not e.label]
 
@@ -127,13 +158,19 @@ def create_three_way_split(examples: List[LabeledExample]) -> Split:
 
     def split_group(group: List[LabeledExample]) -> Tuple[List, List, List]:
         n = len(group)
-        train_size = max(2, int(n * 0.15))
-        test_size = int(n * 0.42)
-        dev_size = n - train_size - test_size
+        desired_train = max(2, int(n * 0.15))
+        desired_test = int(n * 0.42)
+        independent = [e for e in group if e.independently_labeled]
+        test_size = min(desired_test, len(independent))
+        test = independent[:test_size]
+        test_ids = {id(e) for e in test}
+        remainder = [e for e in group if id(e) not in test_ids]
+        train_size = min(desired_train, max(0, len(remainder) - 1))
+        dev_size = len(remainder) - train_size
         return (
-            group[:train_size],
-            group[train_size:train_size + dev_size],
-            group[train_size + dev_size:]
+            remainder[:train_size],
+            remainder[train_size:train_size + dev_size],
+            test,
         )
 
     pass_train, pass_dev, pass_test = split_group(pass_examples)
@@ -177,6 +214,8 @@ def build_judge_prompt(
         prompt_parts.append("")
         for i, ex in enumerate(pass_examples, 1):
             prompt_parts.append(f"**example {i}:**")
+            provenance = "independently reviewed" if ex.independently_labeled else "weak/model-generated reference"
+            prompt_parts.append(f"label provenance: {provenance}")
             prompt_parts.append("```")
             prompt_parts.append(ex.text[:500])
             prompt_parts.append("```")
@@ -188,6 +227,8 @@ def build_judge_prompt(
         prompt_parts.append("")
         for i, ex in enumerate(fail_examples, 1):
             prompt_parts.append(f"**example {i}:**")
+            provenance = "independently reviewed" if ex.independently_labeled else "weak/model-generated reference"
+            prompt_parts.append(f"label provenance: {provenance}")
             prompt_parts.append("```")
             prompt_parts.append(ex.text[:500])
             prompt_parts.append("```")
@@ -352,6 +393,15 @@ def split_mode(args):
     split = create_three_way_split(examples)
     console.print(f"\n[green]split: train={len(split.train)}, dev={len(split.dev)}, test={len(split.test)}[/green]")
 
+    test_pass = sum(1 for e in split.test if e.label)
+    test_fail = len(split.test) - test_pass
+    if test_pass == 0 or test_fail == 0:
+        console.print(
+            "[red]cannot create an independent PASS/FAIL held-out test for "
+            f"'{args.dimension}'. Add manually reviewed labels for both classes.[/red]"
+        )
+        sys.exit(1)
+
     # build judge prompt
     definition = load_dimension_definition(Path(args.dimensions), args.dimension)
     judge_prompt = build_judge_prompt(args.dimension, definition, split.train)
@@ -410,6 +460,8 @@ def split_mode(args):
                 f.write(json.dumps({
                     "id": i,
                     "human_label": "PASS" if ex.label else "FAIL",
+                    "label_provenance": ex.provenance,
+                    "independent": ex.independently_labeled,
                 }) + "\n")
 
     console.print(f"\n[bold]next step:[/bold] tell claude code to judge each example in {batch_path}")
@@ -434,6 +486,8 @@ def score_mode(args):
         for line in f:
             if line.strip():
                 truth.append(json.loads(line))
+
+    heldout_is_independent = all(t.get("independent", False) for t in truth)
 
     # convert to LabeledExamples
     examples = [
@@ -472,6 +526,13 @@ def score_mode(args):
 
     # go/no-go only on test set
     if split_name == "test":
+        if not heldout_is_independent:
+            console.print(
+                "\n[bold red]NO-GO:[/bold red] held-out labels are not all "
+                "independently reviewed. Re-run split after manual labeling; "
+                "model-generated labels cannot certify judge accuracy."
+            )
+            return
         go, reason = go_nogo_decision(metrics)
         status = "[green]GO" if go else "[red]NO-GO"
         console.print(f"\n[bold]{status}:[/bold] {reason}[/{'green' if go else 'red'}]")
@@ -507,7 +568,28 @@ def score_mode(args):
 
 
 def flip_mode(args):
-    """flip human labels to match judge verdicts for disagreements, then re-score."""
+    """reject the unsafe legacy mode instead of changing reference labels."""
+    console.print(
+        "[bold red]flip-to-judge is disabled.[/bold red] Reference labels "
+        "must never be changed to match a judge, especially on test. "
+        "Use --mode adjudicate on the dev split for explicit human decisions."
+    )
+    raise SystemExit(2)
+
+
+def adjudicate_mode(args):
+    """collect explicit human decisions for dev disagreements only.
+
+    Adjudication updates the development source/truth labels with provenance;
+    the held-out test files are never read for writing and remain immutable.
+    """
+    if args.split != "dev":
+        console.print(
+            "[bold red]adjudication is limited to the dev split; "
+            "held-out test labels are immutable.[/bold red]"
+        )
+        raise SystemExit(2)
+
     output_dir = Path(args.output_dir)
     split_name = args.split
 
@@ -526,63 +608,90 @@ def flip_mode(args):
     truth = [json.loads(l) for l in open(truth_path) if l.strip()]
 
     # find disagreements
-    flips = {}  # (text_prefix, dimension) -> new_label
+    disagreements = []
     for i, (b, r, t) in enumerate(zip(batch, results, truth)):
         jl = "PASS" if r["verdict"].strip().upper().startswith("PASS") else "FAIL"
         if jl != t["human_label"]:
-            flips[(b["text"][:100], args.dimension)] = jl
+            disagreements.append((i, b, r, t, jl))
 
-    if not flips:
+    if not disagreements:
         console.print(f"[green]no disagreements found for {args.dimension} {split_name} set[/green]")
         return
 
-    console.print(f"[yellow]flipping {len(flips)} labels for {args.dimension} ({split_name})[/yellow]")
+    console.print(
+        f"[yellow]{len(disagreements)} disagreements require independent "
+        "human adjudication; the judge verdict is only context.[/yellow]"
+    )
+    decisions = {}
+    for i, b, r, t, jl in disagreements:
+        console.print(Panel(b["text"], title=f"dev example {i}"))
+        console.print(f"reference: {t['human_label']} | judge: {jl}")
+        choice = Prompt.ask(
+            "independent decision [p]ass / [f]ail / [q]uit",
+            choices=["p", "f", "q"], show_choices=False,
+        ).lower()
+        if choice == "q":
+            break
+        label = "PASS" if choice == "p" else "FAIL"
+        reason = Prompt.ask("why? (brief rationale)", default="").strip()
+        decisions[i] = {"label": label, "reason": reason, "judge_label": jl}
 
-    # update label source files
-    label_files = [Path("examples/labels_real.jsonl"), Path("examples/synthetic_labels.jsonl")]
+    if not decisions:
+        console.print("[yellow]no adjudications recorded[/yellow]")
+        return
+
+    # Persist the explicit decisions as an audit trail and update only dev
+    # truth.  Test truth is intentionally never touched.
+    adjudication_path = output_dir / f"{args.dimension}_{split_name}_adjudications.jsonl"
+    with open(adjudication_path, "a") as f:
+        for i, decision in decisions.items():
+            b = batch[i]
+            f.write(json.dumps({
+                "id": i, "text": b["text"], "dimension": args.dimension,
+                "human_label": decision["label"],
+                "label_provenance": "human_adjudicated",
+                "judge_label": decision["judge_label"],
+                "critique": decision["reason"],
+            }) + "\n")
+
+    truth_by_id = {i: t for i, t in enumerate(truth)}
+    for i, decision in decisions.items():
+        truth_by_id[i]["human_label"] = decision["label"]
+        truth_by_id[i]["label_provenance"] = "human_adjudicated"
+        truth_by_id[i]["independent"] = True
+    truth_path.write_text("\n".join(json.dumps(truth_by_id[i]) for i in range(len(truth))) + "\n")
+
+    # Update matching source records so a future split retains the provenance.
+    label_files = [Path(args.labels), Path("examples/labels_real.jsonl"),
+                   Path("examples/real_excerpts.jsonl"), Path("examples/synthetic_labels.jsonl")]
+    decision_by_key = {
+        (batch[i]["text"], args.dimension): decision
+        for i, decision in decisions.items()
+    }
+    seen_paths = set()
     for lf in label_files:
-        if not lf.exists():
+        if not lf.exists() or lf in seen_paths:
             continue
-        lines = lf.read_text().splitlines()
+        seen_paths.add(lf)
         updated = []
-        flipped = 0
-        for line in lines:
+        changed = 0
+        for line in lf.read_text().splitlines():
             if not line.strip():
                 updated.append(line)
                 continue
             obj = json.loads(line)
-            key = (obj.get("text", "")[:100], obj.get("dimension", ""))
-            if key in flips:
-                obj["human_label"] = flips[key]
-                flipped += 1
+            decision = decision_by_key.get((obj.get("text", ""), obj.get("dimension", "")))
+            if decision:
+                obj["human_label"] = decision["label"]
+                obj["label_provenance"] = "human_adjudicated"
+                obj["critique"] = decision["reason"]
+                changed += 1
             updated.append(json.dumps(obj))
-        lf.write_text("\n".join(updated) + "\n")
-        if flipped:
-            console.print(f"  {lf}: flipped {flipped}")
+        if changed:
+            lf.write_text("\n".join(updated) + "\n")
+            console.print(f"  {lf}: adjudicated {changed}")
 
-    # update truth files for both splits
-    for sn in ["dev", "test"]:
-        bp = output_dir / f"{args.dimension}_{sn}_batch.jsonl"
-        tp = output_dir / f"{args.dimension}_{sn}_truth.jsonl"
-        if not bp.exists() or not tp.exists():
-            continue
-        b_lines = [l for l in open(bp) if l.strip()]
-        t_lines = [l for l in open(tp) if l.strip()]
-        updated = []
-        flipped = 0
-        for bl, tl in zip(b_lines, t_lines):
-            b = json.loads(bl)
-            t = json.loads(tl)
-            key = (b["text"][:100], args.dimension)
-            if key in flips:
-                t["human_label"] = flips[key]
-                flipped += 1
-            updated.append(json.dumps(t))
-        tp.write_text("\n".join(updated) + "\n")
-        if flipped:
-            console.print(f"  {tp}: flipped {flipped}")
-
-    console.print(f"[green]done. re-scoring {split_name}...[/green]\n")
+    console.print(f"[green]recorded {len(decisions)} dev adjudications; re-scoring...[/green]\n")
     score_mode(args)
 
 
@@ -590,8 +699,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="per-dimension judge validation (data-only, no LLM calls)"
     )
-    parser.add_argument("--mode", choices=["split", "score", "flip-to-judge"],
-                        required=True, help="split: prepare data; score: compute metrics; flip-to-judge: align labels with judge")
+    parser.add_argument("--mode", choices=["split", "score", "adjudicate", "flip-to-judge"],
+                        required=True, help="split: prepare data; score: compute metrics; adjudicate: independently review dev disagreements")
     parser.add_argument("--dimension", required=True, help="dimension name")
     parser.add_argument("--labels", default="examples/labels.jsonl",
                         help="path to labeled examples")
@@ -610,6 +719,8 @@ def main():
         score_mode(args)
     elif args.mode == "flip-to-judge":
         flip_mode(args)
+    elif args.mode == "adjudicate":
+        adjudicate_mode(args)
 
 
 if __name__ == "__main__":

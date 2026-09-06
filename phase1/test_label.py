@@ -293,11 +293,71 @@ def test_codex_mock_roundtrip():
         shutil.rmtree(tmpdir)
 
 
+def test_auto_accept_preserves_model_provenance():
+    """auto labels must not be serialized as human gold."""
+    from importlib.machinery import SourceFileLoader
+    label_mod = SourceFileLoader("label", str(Path(__file__).parent / "3_label.py")).load_module()
+    output_path = Path(tempfile.mkdtemp(prefix="autorefine_auto_") ) / "labels.jsonl"
+    try:
+        label_mod.auto_accept_synthetic([
+            {"text": "synthetic excerpt", "dimension": "clarity",
+             "model_label": "PASS", "model_reason": "model rationale"}
+        ], output_path)
+        record = json.loads(output_path.read_text())
+        assert "human_label" not in record
+        assert record["label"] == "PASS"
+        assert record["label_provenance"] == "model_auto"
+        return True
+    finally:
+        import shutil
+        shutil.rmtree(output_path.parent)
+
+
+def test_model_labels_never_enter_heldout_split():
+    """split logic reserves only independently labeled examples for test."""
+    from importlib.machinery import SourceFileLoader
+    validate_mod = SourceFileLoader("validate", str(Path(__file__).parent / "4_validate_judge.py")).load_module()
+    examples = [
+        validate_mod.LabeledExample(f"pass-{i}", "clarity", True, "synthetic", "model_auto")
+        for i in range(8)
+    ] + [
+        validate_mod.LabeledExample(f"fail-{i}", "clarity", False, "synthetic", "model_auto")
+        for i in range(8)
+    ] + [
+        validate_mod.LabeledExample("human-pass", "clarity", True, "real", "human"),
+        validate_mod.LabeledExample("human-fail", "clarity", False, "real", "human"),
+    ]
+    split = validate_mod.create_three_way_split(examples)
+    assert split.test
+    assert all(e.independently_labeled for e in split.test)
+    assert not any(e.provenance == "model_auto" for e in split.test)
+    return True
+
+
+def test_heldout_label_tuning_is_rejected():
+    """legacy flip and new adjudication modes cannot write test labels."""
+    from importlib.machinery import SourceFileLoader
+    from types import SimpleNamespace
+    validate_mod = SourceFileLoader("validate", str(Path(__file__).parent / "4_validate_judge.py")).load_module()
+    args = SimpleNamespace(split="test", output_dir="unused", dimension="clarity", labels="unused")
+    for mode in (validate_mod.flip_mode, validate_mod.adjudicate_mode):
+        try:
+            mode(args)
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError("held-out tuning mode should fail closed")
+    return True
+
+
 if __name__ == "__main__":
     print("running 3_label.py tests...\n")
     results = []
     for test_fn in [test_write_prelabel_request, test_batch_label_real, test_dry_run_real,
-                    test_assisted_label_via_pexpect, test_codex_mock_roundtrip]:
+                    test_assisted_label_via_pexpect, test_codex_mock_roundtrip,
+                    test_auto_accept_preserves_model_provenance,
+                    test_model_labels_never_enter_heldout_split,
+                    test_heldout_label_tuning_is_rejected]:
         try:
             results.append(test_fn())
         except Exception as e:
